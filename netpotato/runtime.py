@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import signal
 import subprocess
+import sys
 import threading
 import time
 from typing import Any, Optional
@@ -21,6 +22,7 @@ from .probes import (
     fetch_snapshot,
     snapshot_baseline_ip,
     snapshot_diagnostics,
+    snapshot_quality_reason,
     snapshot_summary,
 )
 
@@ -69,6 +71,7 @@ class SessionRecord:
     last_error: Optional[str] = None
     ip_mismatch_count: int = 0
     ip_change_count: int = 0
+    ip_quality_issue_count: int = 0
     session_dir: str = ""
     log_file: str = ""
     child_exit_code: Optional[int] = None
@@ -87,16 +90,24 @@ class MonitorState:
     last_transition: Optional[str] = None
     mismatch_active: bool = False
     change_active: bool = False
+    quality_active: bool = False
+    inconclusive_streak: int = 0
 
 
 @dataclass
 class Evaluation:
-    good_sample: bool
+    classification: str
+    healthy_sample: bool
     should_block: bool
     reasons: list[str]
     observed_baseline: Optional[str]
     has_ip_mismatch: bool
     has_ip_change: bool
+    has_poor_ip_quality: bool
+
+
+class StartupGuardError(RuntimeError):
+    """Raised when startup checks determine the app should not launch."""
 
 
 def session_root(config: NetpotatoConfig) -> Path:
@@ -322,30 +333,39 @@ def evaluate_snapshot(
         if diagnostics:
             reason = f"{reason} ({'; '.join(diagnostics)})"
         reasons.append(reason)
-        should_block = should_block or config.on_ip_mismatch == "block"
     if snapshot.is_remote_mismatch():
         reasons.append("probe results were inconsistent across vantage points")
-        should_block = should_block or config.on_ip_mismatch == "block"
 
     observed_baseline = snapshot_baseline_ip(snapshot)
     has_ip_change = bool(baseline_ip and observed_baseline and observed_baseline != baseline_ip)
+    classification = "healthy"
+    quality_reason = snapshot_quality_reason(snapshot, config)
+    has_poor_ip_quality = quality_reason is not None
     if has_ip_change:
         reasons.append(f"observed public IP {observed_baseline} differs from baseline {baseline_ip}")
+        classification = "unsafe"
         should_block = should_block or config.on_ip_change == "block"
+    elif has_poor_ip_quality:
+        reasons.append(quality_reason)
+        classification = "unsafe"
+        should_block = should_block or config.on_ip_quality == "block"
+    elif has_ip_mismatch:
+        classification = "inconclusive"
+    elif observed_baseline is None:
+        classification = "inconclusive"
+        reasons.append("probe results could not establish a stable public IP")
 
-    good_sample = False
-    if baseline_ip:
-        good_sample = observed_baseline == baseline_ip and not reasons
-    else:
-        good_sample = observed_baseline is not None and not reasons
+    healthy_sample = classification == "healthy"
 
     return Evaluation(
-        good_sample=good_sample,
+        classification=classification,
+        healthy_sample=healthy_sample,
         should_block=should_block,
         reasons=reasons,
         observed_baseline=observed_baseline,
         has_ip_mismatch=has_ip_mismatch,
         has_ip_change=has_ip_change,
+        has_poor_ip_quality=has_poor_ip_quality,
     )
 
 
@@ -354,8 +374,11 @@ def update_incident_counts(state: MonitorState, evaluation: Evaluation) -> None:
         state.record.ip_mismatch_count += 1
     if evaluation.has_ip_change and not state.change_active:
         state.record.ip_change_count += 1
+    if evaluation.has_poor_ip_quality and not state.quality_active:
+        state.record.ip_quality_issue_count += 1
     state.mismatch_active = evaluation.has_ip_mismatch
     state.change_active = evaluation.has_ip_change
+    state.quality_active = evaluation.has_poor_ip_quality
 
 
 def preflight_launch(command: list[str], session: SessionRecord) -> subprocess.Popen[Any]:
@@ -372,6 +395,128 @@ def preflight_launch(command: list[str], session: SessionRecord) -> subprocess.P
     )
     session.child_pid = process.pid
     return process
+
+
+def run_preflight_checks(
+    app_name: str,
+    config: NetpotatoConfig,
+    state: MonitorState,
+    session_file: Path,
+) -> None:
+    required_samples = config.preflight_good_samples
+    state.record.state = "preflight"
+    state.record.blocked = False
+    state.record.block_reason = None
+    update_session_record(session_file, state.record, None, None)
+    logging.info("Starting preflight checks for %s", app_name)
+
+    while state.baseline_ip is None:
+        state.record.last_event = "preflight"
+        try:
+            snapshot = fetch_snapshot(
+                config.probe_url,
+                config.timeout_sec,
+                quality_enabled=config.ip_quality_enabled,
+            )
+            evaluation = evaluate_snapshot(snapshot, None, config)
+            state.last_error = None
+            state.last_snapshot = snapshot
+            update_incident_counts(state, evaluation)
+
+            quality_is_blocking = evaluation.has_poor_ip_quality and config.on_ip_quality == "block"
+            quality_is_notify_only = evaluation.has_poor_ip_quality and config.on_ip_quality != "block"
+
+            if quality_is_blocking:
+                message = "; ".join(evaluation.reasons) or "current IP quality is unsafe"
+                state.record.state = "blocked"
+                state.record.blocked = True
+                state.record.block_reason = message
+                update_session_record(session_file, state.record, snapshot, None)
+                notify_once(
+                    state,
+                    config.notify_command,
+                    event="startup_blocked",
+                    title=f"{app_name} startup blocked by netpotato",
+                    message=f"{message}\n\nSnapshot: {snapshot_summary(snapshot)}",
+                )
+                print(
+                    f"netpotato: blocked startup for {app_name}: {message}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                raise StartupGuardError(message)
+
+            if (evaluation.healthy_sample or quality_is_notify_only) and evaluation.observed_baseline:
+                state.bad_streak = 0
+                state.good_streak += 1
+                state.record.block_reason = None if evaluation.healthy_sample else "; ".join(evaluation.reasons) or None
+                if quality_is_notify_only and evaluation.reasons:
+                    notify_once(
+                        state,
+                        config.notify_command,
+                        event="ip_quality_warn",
+                        title=f"{app_name} startup IP quality warning",
+                        message="; ".join(evaluation.reasons),
+                    )
+                if state.good_streak >= required_samples:
+                    state.baseline_ip = evaluation.observed_baseline
+                    state.record.baseline_ip = state.baseline_ip
+                    state.record.state = "starting"
+                    notify_once(
+                        state,
+                        config.notify_command,
+                        event="baseline_created",
+                        title=f"{app_name} baseline established",
+                        message=(
+                            f"Baseline IP: {state.baseline_ip}\n\n"
+                            f"Snapshot: {snapshot_summary(snapshot)}"
+                        ),
+                    )
+            else:
+                state.good_streak = 0
+                state.record.state = "preflight"
+                state.record.block_reason = "; ".join(evaluation.reasons) or None
+                if evaluation.reasons:
+                    notify_once(
+                        state,
+                        config.notify_command,
+                        event="preflight_wait",
+                        title=f"{app_name} waiting for stable baseline",
+                        message=f"Reasons: {'; '.join(evaluation.reasons)}",
+                    )
+
+            update_session_record(session_file, state.record, snapshot, None)
+            logging.info(
+                "Preflight result: status=%s baseline=%s snapshot=%s",
+                evaluation.classification,
+                state.baseline_ip,
+                snapshot_summary(snapshot),
+            )
+        except StartupGuardError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            error_message = str(exc)
+            state.good_streak = 0
+            state.mismatch_active = False
+            state.change_active = False
+            state.quality_active = False
+            state.record.state = "preflight"
+            state.record.block_reason = error_message
+            if error_message != state.last_error:
+                notify_once(
+                    state,
+                    config.notify_command,
+                    event="probe_failure",
+                    title=f"{app_name} preflight probe failed",
+                    message=error_message,
+                )
+            state.last_error = error_message
+            update_session_record(session_file, state.record, None, error_message)
+            logging.exception("Preflight probe failed: %s", error_message)
+
+        if state.baseline_ip is not None:
+            break
+        time.sleep(config.interval_sec)
 
 
 def run_monitor_loop(
@@ -395,15 +540,17 @@ def run_monitor_loop(
             snapshot = fetch_snapshot(
                 config.probe_url,
                 config.timeout_sec,
+                quality_enabled=config.ip_quality_enabled,
             )
             evaluation = evaluate_snapshot(snapshot, state.baseline_ip, config)
             state.last_error = None
             state.last_snapshot = snapshot
             update_incident_counts(state, evaluation)
 
-            if evaluation.should_block:
+            if evaluation.classification == "unsafe" and evaluation.should_block:
                 state.bad_streak += 1
                 state.good_streak = 0
+                state.inconclusive_streak = 0
                 block_reason = "; ".join(evaluation.reasons) or "unsafe IP state"
                 if not state.blocked and state.bad_streak >= config.bad_samples_to_block:
                     controller.block()
@@ -422,17 +569,16 @@ def run_monitor_loop(
                     state.record.state = "blocked"
                     state.record.block_reason = block_reason
                 else:
-                    state.record.state = "suspect"
+                    state.record.state = "unsafe"
                     state.record.block_reason = block_reason
-            elif evaluation.good_sample:
+            elif evaluation.healthy_sample:
                 state.bad_streak = 0
                 state.good_streak += 1
+                state.inconclusive_streak = 0
                 if state.baseline_ip is None and evaluation.observed_baseline:
-                    if state.good_streak >= config.good_samples_to_recover:
+                    if state.good_streak >= config.preflight_good_samples:
                         state.baseline_ip = evaluation.observed_baseline
                         state.record.baseline_ip = state.baseline_ip
-                        state.record.state = "healthy"
-                        state.record.block_reason = None
                         notify_once(
                             state,
                             config.notify_command,
@@ -443,7 +589,7 @@ def run_monitor_loop(
                                 f"Snapshot: {snapshot_summary(snapshot)}"
                             ),
                         )
-                elif state.blocked and state.good_streak >= config.good_samples_to_recover:
+                if state.blocked and state.baseline_ip is not None and state.good_streak >= config.recover_good_samples:
                     controller.unblock()
                     state.blocked = False
                     state.record.blocked = False
@@ -459,6 +605,9 @@ def run_monitor_loop(
                             f"Snapshot: {snapshot_summary(snapshot)}"
                         ),
                     )
+                elif state.blocked:
+                    state.record.state = "recovering"
+                    state.record.block_reason = None
                 elif not state.blocked and state.baseline_ip is not None:
                     state.record.state = "healthy"
                     state.record.block_reason = None
@@ -466,25 +615,71 @@ def run_monitor_loop(
             else:
                 state.bad_streak = 0
                 state.good_streak = 0
-                state.record.state = "blocked" if state.blocked else "degraded"
-                state.record.block_reason = "; ".join(evaluation.reasons) or None
-                if evaluation.reasons:
-                    notify_once(
-                        state,
-                        config.notify_command,
-                        event="degraded",
-                        title=f"{app_name} probe degraded",
-                        message=(
-                            "The guard could not fully validate the current IP state.\n\n"
-                            f"Reasons: {'; '.join(evaluation.reasons)}\n\n"
-                            f"Snapshot: {snapshot_summary(snapshot)}"
-                        ),
+                block_reason = "; ".join(evaluation.reasons) or "current IP state could not be validated"
+                if evaluation.classification == "inconclusive":
+                    state.inconclusive_streak += 1
+                    should_block_inconclusive = (
+                        config.on_ip_mismatch == "block"
+                        and state.inconclusive_streak >= config.inconclusive_samples_to_block
                     )
+                    if should_block_inconclusive:
+                        if not state.blocked:
+                            controller.block()
+                            state.blocked = True
+                            state.record.blocked = True
+                            state.record.state = "blocked"
+                            state.record.block_reason = block_reason
+                            notify_once(
+                                state,
+                                config.notify_command,
+                                event="blocked",
+                                title=f"{app_name} blocked by netpotato",
+                                message=f"Reason: {block_reason}\n\nSnapshot: {snapshot_summary(snapshot)}",
+                            )
+                        else:
+                            state.record.state = "blocked"
+                            state.record.block_reason = block_reason
+                    else:
+                        if state.blocked:
+                            state.record.state = "blocked"
+                        else:
+                            state.record.state = "degraded"
+                        state.record.block_reason = block_reason
+                        if evaluation.reasons:
+                            notify_once(
+                                state,
+                                config.notify_command,
+                                event="degraded",
+                                title=f"{app_name} probe degraded",
+                                message=(
+                                    "The guard could not fully validate the current IP state.\n\n"
+                                    f"Reasons: {'; '.join(evaluation.reasons)}"
+                                ),
+                            )
+                else:
+                    state.inconclusive_streak = 0
+                    if state.blocked:
+                        state.record.state = "blocked"
+                    else:
+                        state.record.state = "unsafe"
+                    state.record.block_reason = block_reason
+                    if evaluation.reasons:
+                        notify_once(
+                            state,
+                            config.notify_command,
+                            event="unsafe",
+                            title=f"{app_name} flagged an unsafe IP state",
+                            message=(
+                                f"Reasons: {'; '.join(evaluation.reasons)}\n\n"
+                                f"Snapshot: {snapshot_summary(snapshot)}"
+                            ),
+                        )
 
             update_session_record(session_file, state.record, snapshot, None)
             logging.info(
-                "Guard check result: state=%s blocked=%s baseline=%s snapshot=%s",
+                "Guard check result: state=%s status=%s blocked=%s baseline=%s snapshot=%s",
                 state.record.state,
+                evaluation.classification,
                 state.blocked,
                 state.baseline_ip,
                 snapshot_summary(snapshot),
@@ -492,8 +687,10 @@ def run_monitor_loop(
         except Exception as exc:  # noqa: BLE001
             error_message = str(exc)
             state.good_streak = 0
+            state.inconclusive_streak = 0
             state.mismatch_active = False
             state.change_active = False
+            state.quality_active = False
             state.record.block_reason = error_message
             if config.on_probe_failure == "block":
                 state.bad_streak += 1
@@ -579,14 +776,28 @@ def launch_command(config: NetpotatoConfig, command_argv: list[str]) -> int:
         log_file=str(log_file),
     )
     update_session_record(session_file, session, None, None)
+    state = MonitorState(record=session)
+    try:
+        if config.startup_fail_closed:
+            run_preflight_checks(app_name, config, state, session_file)
+            state.good_streak = 0
+            state.bad_streak = 0
+            state.inconclusive_streak = 0
+    except StartupGuardError:
+        session.blocked = state.record.blocked
+        session.state = state.record.state
+        session.block_reason = state.record.block_reason
+        session.baseline_ip = state.baseline_ip
+        session.ended_at = now_iso()
+        update_session_record(session_file, session, state.last_snapshot, state.last_error)
+        return 3
 
     logging.info("Launching command %s", command_argv)
     process = preflight_launch(command_argv, session)
-    update_session_record(session_file, session, None, None)
+    update_session_record(session_file, session, state.last_snapshot, state.last_error)
 
     controller = FreezeController(process.pid, config.block_descendants)
     stop_event = threading.Event()
-    state = MonitorState(record=session)
     install_signal_handlers(controller, stop_event)
 
     monitor_thread = threading.Thread(
@@ -624,23 +835,67 @@ def launch_command(config: NetpotatoConfig, command_argv: list[str]) -> int:
 
 def watch_test_status(config: NetpotatoConfig) -> int:
     baseline_ip: Optional[str] = None
+    bad_streak = 0
+    inconclusive_streak = 0
     try:
         while True:
             timestamp = now_iso()
             try:
-                snapshot = fetch_snapshot(config.probe_url, config.timeout_sec)
+                snapshot = fetch_snapshot(
+                    config.probe_url,
+                    config.timeout_sec,
+                    quality_enabled=config.ip_quality_enabled,
+                )
                 observed_ip = snapshot_baseline_ip(snapshot)
                 evaluation = evaluate_snapshot(snapshot, baseline_ip, config)
                 diagnostics = list(evaluation.reasons)
-                if baseline_ip is None and observed_ip:
+                action = "allow"
+                if evaluation.classification == "unsafe" and evaluation.should_block:
+                    bad_streak += 1
+                    inconclusive_streak = 0
+                    action = "block" if bad_streak >= config.bad_samples_to_block else "warn"
+                elif evaluation.classification == "unsafe":
+                    bad_streak = 0
+                    inconclusive_streak = 0
+                    action = "warn"
+                elif evaluation.classification == "inconclusive":
+                    bad_streak = 0
+                    inconclusive_streak += 1
+                    if (
+                        config.on_ip_mismatch == "block"
+                        and inconclusive_streak >= config.inconclusive_samples_to_block
+                    ):
+                        action = "block"
+                    else:
+                        action = "degraded"
+                else:
+                    bad_streak = 0
+                    inconclusive_streak = 0
+
+                if baseline_ip is None and observed_ip and (
+                    evaluation.healthy_sample
+                    or (evaluation.has_poor_ip_quality and config.on_ip_quality != "block")
+                ):
                     baseline_ip = observed_ip
 
-                prefix = "🥔 " if diagnostics else ""
-                print(f"{prefix}[{timestamp}] {snapshot_summary(snapshot)}")
+                prefix = "🥔 " if action == "block" else ""
+                print(
+                    f"{prefix}[{timestamp}] status={evaluation.classification} action={action} "
+                    f"baseline={baseline_ip or 'unset'} {snapshot_summary(snapshot)}"
+                )
                 if diagnostics:
                     print(f"details: {'; '.join(diagnostics)}")
             except Exception as exc:  # noqa: BLE001
-                print(f"🥔 [{timestamp}] probe_error={exc}")
+                if config.on_probe_failure == "block":
+                    bad_streak += 1
+                    prefix = "🥔 " if bad_streak >= config.bad_samples_to_block else ""
+                    action = "block" if prefix else "warn"
+                else:
+                    bad_streak = 0
+                    action = "degraded"
+                    prefix = ""
+                inconclusive_streak = 0
+                print(f"{prefix}[{timestamp}] probe_error={exc} action={action}")
             print(end="", flush=True)
             time.sleep(config.interval_sec)
     except KeyboardInterrupt:
@@ -694,6 +949,7 @@ def print_status(config: NetpotatoConfig, limit: int) -> int:
             f"state={payload.get('state')} blocked={payload.get('blocked')} "
             f"ip_mismatch_count={payload.get('ip_mismatch_count', 0)} "
             f"ip_change_count={payload.get('ip_change_count', 0)} "
+            f"ip_quality_issue_count={payload.get('ip_quality_issue_count', 0)} "
             f"pid={payload.get('child_pid')} started_at={payload.get('started_at')}"
         )
 

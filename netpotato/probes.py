@@ -15,6 +15,7 @@ from urllib.request import Request, urlopen
 
 
 DEFAULT_PROBE_URL = "https://ip111.cn/"
+DEFAULT_SCAMALYTICS_URL_TEMPLATE = "https://scamalytics.com/ip/{ip}"
 
 SECTION_LABELS = {
     "domestic": "从国内测试",
@@ -32,6 +33,42 @@ IP_TOKEN_RE = re.compile(r"[0-9A-Fa-f:.%]+")
 HTML_TAG_RE = re.compile(r"(?s)<[^>]+>")
 SCRIPT_STYLE_RE = re.compile(r"(?is)<(script|style).*?>.*?</\1>")
 IFRAME_SRC_RE = re.compile(r'(?is)<iframe\b[^>]*\bsrc=["\']([^"\']+)["\']')
+FRAUD_SCORE_RE = re.compile(r"Fraud Score:\s*(\d+)", re.IGNORECASE)
+FRAUD_RISK_RE = re.compile(r"^(very high|high|medium|low|very low)\s+risk$", re.IGNORECASE)
+LINE_PREFIXES = {
+    "isp_name": "ISP Name ",
+    "country_name": "Country Name ",
+}
+SCAMALYTICS_PROXY_LABELS = {
+    "Anonymizing VPN": "is_anonymizing_vpn",
+    "Tor Exit Node": "is_tor_exit_node",
+    "Server": "is_server",
+    "Public Proxy": "is_public_proxy",
+    "Web Proxy": "is_web_proxy",
+}
+SCAMALYTICS_BLACKLIST_LABELS = (
+    "Firehol",
+    "IP2ProxyLite",
+    "IPsum",
+    "Spamhaus",
+    "X4Bnet Spambot",
+)
+
+
+@dataclass
+class IPQuality:
+    ip: str
+    risk: str
+    score: Optional[int]
+    source_url: str
+    isp_name: Optional[str] = None
+    country_name: Optional[str] = None
+    is_blacklisted_external: Optional[bool] = None
+    is_anonymizing_vpn: Optional[bool] = None
+    is_tor_exit_node: Optional[bool] = None
+    is_server: Optional[bool] = None
+    is_public_proxy: Optional[bool] = None
+    is_web_proxy: Optional[bool] = None
 
 
 @dataclass
@@ -47,6 +84,8 @@ class Snapshot:
     foreign_error: Optional[str] = None
     google_source: str = ""
     google_error: Optional[str] = None
+    ip_quality: Optional[IPQuality] = None
+    ip_quality_error: Optional[str] = None
 
     def available_remote_ips(self) -> list[str]:
         return [ip for ip in (self.domestic, self.foreign, self.google) if ip]
@@ -188,6 +227,72 @@ def parse_snapshot(page_html: str, source_url: str) -> Snapshot:
     return snapshot
 
 
+def parse_yes_no_unknown(value: str) -> Optional[bool]:
+    normalized = value.strip().lower()
+    if normalized == "yes":
+        return True
+    if normalized == "no":
+        return False
+    return None
+
+
+def next_line_value(lines: list[str], index: int) -> Optional[str]:
+    if index + 1 >= len(lines):
+        return None
+    return lines[index + 1]
+
+
+def parse_scamalytics_quality(page_html: str, ip: str, source_url: str) -> IPQuality:
+    lines = html_to_lines(page_html)
+    score: Optional[int] = None
+    risk = "unknown"
+    isp_name: Optional[str] = None
+    country_name: Optional[str] = None
+    proxy_values: dict[str, Optional[bool]] = {}
+    blacklist_flags: list[bool] = []
+
+    for index, line in enumerate(lines):
+        if score is None:
+            score_match = FRAUD_SCORE_RE.search(line)
+            if score_match:
+                score = int(score_match.group(1))
+
+        if risk == "unknown":
+            risk_match = FRAUD_RISK_RE.match(line)
+            if risk_match:
+                risk = risk_match.group(1).lower()
+
+        if isp_name is None and line.startswith(LINE_PREFIXES["isp_name"]):
+            isp_name = line.removeprefix(LINE_PREFIXES["isp_name"]).strip() or None
+        if country_name is None and line.startswith(LINE_PREFIXES["country_name"]):
+            country_name = line.removeprefix(LINE_PREFIXES["country_name"]).strip() or None
+
+        attr = SCAMALYTICS_PROXY_LABELS.get(line)
+        if attr:
+            proxy_values[attr] = parse_yes_no_unknown(next_line_value(lines, index) or "")
+            continue
+
+        if line in SCAMALYTICS_BLACKLIST_LABELS:
+            parsed = parse_yes_no_unknown(next_line_value(lines, index) or "")
+            if parsed is not None:
+                blacklist_flags.append(parsed)
+
+    return IPQuality(
+        ip=ip,
+        risk=risk,
+        score=score,
+        source_url=source_url,
+        isp_name=isp_name,
+        country_name=country_name,
+        is_blacklisted_external=True if any(blacklist_flags) else False if blacklist_flags else None,
+        is_anonymizing_vpn=proxy_values.get("is_anonymizing_vpn"),
+        is_tor_exit_node=proxy_values.get("is_tor_exit_node"),
+        is_server=proxy_values.get("is_server"),
+        is_public_proxy=proxy_values.get("is_public_proxy"),
+        is_web_proxy=proxy_values.get("is_web_proxy"),
+    )
+
+
 def extract_section_fragments(page_html: str) -> dict[str, str]:
     positions: list[tuple[int, str]] = []
     for key, label in SECTION_LABELS.items():
@@ -306,7 +411,13 @@ def fetch_section_ip(
     return None, candidate_urls[0], "; ".join(errors)
 
 
-def fetch_snapshot(probe_url: str, timeout: float) -> Snapshot:
+def fetch_scamalytics_quality(ip: str, timeout: float) -> IPQuality:
+    source_url = DEFAULT_SCAMALYTICS_URL_TEMPLATE.format(ip=ip)
+    body = fetch_url_text(source_url, timeout, referer="https://scamalytics.com/ip")
+    return parse_scamalytics_quality(body, ip, source_url)
+
+
+def fetch_snapshot(probe_url: str, timeout: float, *, quality_enabled: bool = True) -> Snapshot:
     body = fetch_url_text(probe_url, timeout)
     snapshot = parse_snapshot(body, probe_url)
     iframe_sources = discover_iframe_sources(body, probe_url)
@@ -320,6 +431,13 @@ def fetch_snapshot(probe_url: str, timeout: float) -> Snapshot:
         ip, source, error = fetch_section_ip(section, timeout, probe_url, iframe_sources)
         assign_section_result(snapshot, section, ip, source=source, error=error)
 
+    stable_ip = snapshot_baseline_ip(snapshot)
+    if quality_enabled and stable_ip:
+        try:
+            snapshot.ip_quality = fetch_scamalytics_quality(stable_ip, timeout)
+        except Exception as exc:  # noqa: BLE001
+            snapshot.ip_quality_error = build_error_message(exc)
+
     return snapshot
 
 
@@ -329,7 +447,11 @@ def snapshot_summary(snapshot: Snapshot) -> str:
         ("overseas", snapshot.foreign),
         ("google", snapshot.google),
     ]
-    return ", ".join(f"{name}={value or 'unavailable'}" for name, value in values)
+    summary = ", ".join(f"{name}={value or 'unavailable'}" for name, value in values)
+    if snapshot.ip_quality:
+        score = "?" if snapshot.ip_quality.score is None else snapshot.ip_quality.score
+        summary = f"{summary}, quality={snapshot.ip_quality.risk}({score})"
+    return summary
 
 
 def snapshot_diagnostics(snapshot: Snapshot) -> list[str]:
@@ -351,6 +473,55 @@ def snapshot_diagnostics(snapshot: Snapshot) -> list[str]:
             continue
         diagnostics.append(f"{section}: probe returned no IP")
     return diagnostics
+
+
+def snapshot_quality_reason(snapshot: Snapshot, config: object) -> Optional[str]:
+    quality = snapshot.ip_quality
+    if quality is None:
+        return None
+
+    reasons: list[str] = []
+    score = quality.score
+    threshold = getattr(config, "ip_quality_max_score")
+    low_risk_band = quality.risk in {"low", "very low"} and (score is None or score < threshold)
+    if low_risk_band:
+        return None
+
+    if score is not None and score >= threshold:
+        reasons.append(
+            f"Scamalytics reports IP {quality.ip} as {quality.risk} risk with fraud score {score}/100"
+        )
+    elif quality.risk in {"high", "very high"}:
+        reasons.append(f"Scamalytics reports IP {quality.ip} as {quality.risk} risk")
+
+    if getattr(config, "ip_quality_block_proxy"):
+        proxy_flags: list[str] = []
+        if quality.is_anonymizing_vpn:
+            proxy_flags.append("anonymizing VPN")
+        if quality.is_tor_exit_node:
+            proxy_flags.append("Tor exit node")
+        if quality.is_public_proxy:
+            proxy_flags.append("public proxy")
+        if quality.is_web_proxy:
+            proxy_flags.append("web proxy")
+        if quality.is_blacklisted_external:
+            proxy_flags.append("external blacklist hit")
+        if proxy_flags:
+            reasons.append(
+                f"Scamalytics flagged IP {quality.ip} as {'/'.join(proxy_flags)}"
+            )
+
+    if not reasons:
+        return None
+
+    if quality.isp_name or quality.country_name:
+        context = ", ".join(
+            value for value in (quality.isp_name, quality.country_name) if value
+        )
+        if context:
+            reasons.append(f"provider context: {context}")
+
+    return "; ".join(reasons)
 
 
 def snapshot_baseline_ip(snapshot: Snapshot) -> Optional[str]:

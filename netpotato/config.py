@@ -21,15 +21,22 @@ def expand_path(value: str) -> Path:
 
 @dataclass(frozen=True)
 class NetpotatoConfig:
-    interval_sec: float = 4.27
-    timeout_sec: float = 10.0
+    interval_sec: float = 1
+    timeout_sec: float = 10
     probe_url: str = DEFAULT_PROBE_URL
     notify_command: str | None = None
     bad_samples_to_block: int = 1
-    good_samples_to_recover: int = 2
+    inconclusive_samples_to_block: int = 3
+    preflight_good_samples: int = 2
+    recover_good_samples: int = 2
     backend: str = "freeze"
+    startup_fail_closed: bool = True
+    ip_quality_enabled: bool = True
+    ip_quality_max_score: int = 70
+    ip_quality_block_proxy: bool = True
     on_ip_change: str = "block"
-    on_ip_mismatch: str = "block"
+    on_ip_mismatch: str = "notify"
+    on_ip_quality: str = "block"
     on_probe_failure: str = "notify"
     recovery_policy: str = "must_match_original_baseline"
     block_descendants: bool = True
