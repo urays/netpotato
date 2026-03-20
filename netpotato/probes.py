@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
 import html
@@ -11,7 +12,7 @@ import re
 import time
 from typing import Optional
 from urllib.error import HTTPError, URLError
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 from urllib.request import Request, urlopen
 
 
@@ -38,6 +39,8 @@ KNOWN_SECTION_URLS = {
     "google": ("https://sspanel.net/ip.php",),
 }
 RETRY_DELAYS_SEC = (0.25, 0.6)
+MAX_RESPONSE_BYTES = 1024 * 1024
+FETCHABLE_URL_SCHEMES = {"http", "https"}
 
 IP_TOKEN_RE = re.compile(r"[0-9A-Fa-f:.%]+")
 HTML_TAG_RE = re.compile(r"(?s)<[^>]+>")
@@ -120,6 +123,11 @@ def normalize_whitespace(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+def is_fetchable_url(url: str) -> bool:
+    parsed = urlparse(url)
+    return parsed.scheme in FETCHABLE_URL_SCHEMES and bool(parsed.netloc)
+
+
 def _section_source_attr(section: str) -> str:
     return f"{section}_source"
 
@@ -191,27 +199,6 @@ def parse_snapshot(page_html: str, source_url: str) -> Snapshot:
             if found_ip:
                 break
         values[key] = found_ip
-
-    if not any(values.values()):
-        fallback_ips: list[str] = []
-        for line in lines:
-            ip = extract_ip_from_line(line)
-            if ip:
-                fallback_ips.append(ip)
-            if len(fallback_ips) >= 3:
-                break
-        if len(fallback_ips) >= 3:
-            values = {
-                "domestic": fallback_ips[0],
-                "foreign": fallback_ips[1],
-                "google": fallback_ips[2],
-            }
-        else:
-            values = {
-                "domestic": None,
-                "foreign": None,
-                "google": None,
-            }
 
     snapshot = Snapshot(
         domestic=values.get("domestic"),
@@ -315,7 +302,9 @@ def discover_iframe_sources(page_html: str, source_url: str) -> dict[str, str]:
         match = IFRAME_SRC_RE.search(fragment)
         if not match:
             continue
-        sources[key] = urljoin(source_url, html.unescape(match.group(1)))
+        candidate = urljoin(source_url, html.unescape(match.group(1)))
+        if is_fetchable_url(candidate):
+            sources[key] = candidate
     return sources
 
 
@@ -341,6 +330,8 @@ def decode_response_bytes(data: bytes, charset: str | None) -> str:
 
 
 def fetch_url_text(url: str, timeout: float, referer: str | None = None) -> str:
+    if not is_fetchable_url(url):
+        raise ValueError(f"Unsupported probe URL: {url!r}")
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (X11; Linux x86_64) "
@@ -359,7 +350,23 @@ def fetch_url_text(url: str, timeout: float, referer: str | None = None) -> str:
         try:
             with urlopen(request, timeout=timeout) as response:
                 charset = response.headers.get_content_charset()
-                return decode_response_bytes(response.read(), charset)
+                content_length_header = response.headers.get("Content-Length")
+                if content_length_header:
+                    try:
+                        content_length = int(content_length_header)
+                    except ValueError:
+                        content_length = None
+                    else:
+                        if content_length > MAX_RESPONSE_BYTES:
+                            raise ValueError(
+                                f"Probe response exceeded {MAX_RESPONSE_BYTES} bytes."
+                            )
+                payload = response.read(MAX_RESPONSE_BYTES + 1)
+                if len(payload) > MAX_RESPONSE_BYTES:
+                    raise ValueError(
+                        f"Probe response exceeded {MAX_RESPONSE_BYTES} bytes."
+                    )
+                return decode_response_bytes(payload, charset)
         except Exception as exc:  # noqa: BLE001
             last_error = exc
             if attempt >= len(RETRY_DELAYS_SEC):
@@ -385,11 +392,16 @@ def section_candidate_urls(section: str, iframe_sources: dict[str, str]) -> list
     if iframe_url:
         candidates.append(iframe_url)
     candidates.extend(KNOWN_SECTION_URLS.get(section, ()))
-    return dedupe_strings(candidates)
+    return [url for url in dedupe_strings(candidates) if is_fetchable_url(url)]
 
 
 def candidate_referers(probe_url: str) -> list[str | None]:
-    return [*dedupe_strings([probe_url, DEFAULT_PROBE_URL]), None]
+    valid_referers = [
+        referer
+        for referer in dedupe_strings([probe_url, DEFAULT_PROBE_URL])
+        if is_fetchable_url(referer)
+    ]
+    return [*valid_referers, None]
 
 
 def referer_label(referer: str | None) -> str:
@@ -427,7 +439,32 @@ def fetch_scamalytics_quality(ip: str, timeout: float) -> IPQuality:
 
 def direct_ip_candidate_urls(probe_url: str) -> list[str]:
     preferred_url = probe_url if probe_url and probe_url != DEFAULT_PROBE_URL else ""
-    return dedupe_strings([preferred_url, *DIRECT_IP_CANDIDATE_URLS])
+    return [
+        url
+        for url in dedupe_strings([preferred_url, *DIRECT_IP_CANDIDATE_URLS])
+        if is_fetchable_url(url)
+    ]
+
+
+def fetch_domestic_ip(
+    probe_url: str,
+    timeout: float,
+) -> tuple[Optional[str], str, Optional[str]]:
+    candidate_urls = direct_ip_candidate_urls(probe_url)
+    if not candidate_urls:
+        return None, "", "no probe URL available"
+
+    errors: list[str] = []
+    referers = candidate_referers(probe_url)
+    for url in candidate_urls:
+        for referer in referers:
+            try:
+                ip = fetch_plain_ip(url, timeout, referer=referer)
+                return ip, url, None
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"{url} via {referer_label(referer)}: {build_error_message(exc)}")
+
+    return None, candidate_urls[0], "; ".join(errors)
 
 
 def fetch_direct_ip_snapshot(probe_url: str, timeout: float) -> Snapshot:
@@ -492,14 +529,25 @@ def fetch_snapshot(
     snapshot = parse_snapshot(body, probe_url)
     iframe_sources = discover_iframe_sources(body, probe_url)
 
-    if not snapshot.domestic and not snapshot.domestic_source:
+    if not snapshot.domestic:
+        ip, source, error = fetch_domestic_ip(probe_url, timeout)
+        assign_section_result(snapshot, "domestic", ip, source=source, error=error)
+    elif not snapshot.domestic_source:
         snapshot.domestic_source = probe_url
 
-    for section in ("foreign", "google"):
-        if getattr(snapshot, section):
-            continue
-        ip, source, error = fetch_section_ip(section, timeout, probe_url, iframe_sources)
-        assign_section_result(snapshot, section, ip, source=source, error=error)
+    missing_sections = [
+        section for section in ("foreign", "google") if not getattr(snapshot, section)
+    ]
+    if missing_sections:
+        with ThreadPoolExecutor(max_workers=len(missing_sections)) as executor:
+            future_to_section = {
+                executor.submit(fetch_section_ip, section, timeout, probe_url, iframe_sources): section
+                for section in missing_sections
+            }
+            for future in as_completed(future_to_section):
+                section = future_to_section[future]
+                ip, source, error = future.result()
+                assign_section_result(snapshot, section, ip, source=source, error=error)
 
     stable_ip = snapshot_consensus_ip(snapshot, allow_partial=quality_ip_allow_partial)
     if quality_enabled and stable_ip:

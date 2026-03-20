@@ -57,6 +57,10 @@ def resolve_command(command: list[str]) -> list[str]:
         resolved = expand_path(executable)
         if not resolved.exists():
             raise FileNotFoundError(f"Executable not found: {resolved}")
+        if not resolved.is_file():
+            raise FileNotFoundError(f"Executable is not a file: {resolved}")
+        if not os.access(resolved, os.X_OK):
+            raise PermissionError(f"Executable is not runnable: {resolved}")
         return [str(resolved), *command[1:]]
 
     resolved_exec = shutil.which(executable)

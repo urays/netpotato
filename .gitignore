@@ -13,3 +13,4 @@ build/
 
 # Generated wrappers for local development
 bin/
+tests/

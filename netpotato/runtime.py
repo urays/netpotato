@@ -8,9 +8,11 @@ import json
 import logging
 import os
 from pathlib import Path
+import shlex
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from typing import Any, Optional
@@ -27,17 +29,95 @@ from .probes import (
 )
 
 
+PRIVATE_DIR_MODE = 0o700
+PRIVATE_FILE_MODE = 0o600
+
+
 def now_iso() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
 
 
 def ensure_dir(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(path, PRIVATE_DIR_MODE)
+    except OSError:
+        pass
+
+
+def sync_directory(path: Path) -> None:
+    try:
+        directory_fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(directory_fd)
+    except OSError:
+        pass
+    finally:
+        os.close(directory_fd)
+
+
+def write_text_atomic(path: Path, text: str) -> None:
+    ensure_dir(path.parent)
+    temp_path: Optional[Path] = None
+    fd, raw_temp_path = tempfile.mkstemp(
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        text=True,
+    )
+    try:
+        temp_path = Path(raw_temp_path)
+        try:
+            os.fchmod(fd, PRIVATE_FILE_MODE)
+        except OSError:
+            pass
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+        sync_directory(path.parent)
+        temp_path = None
+    finally:
+        if temp_path is not None:
+            try:
+                temp_path.unlink()
+            except FileNotFoundError:
+                pass
+
+
+def read_proc_identity(pid: int) -> Optional[tuple[int, int]]:
+    try:
+        stat_text = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+    except (FileNotFoundError, PermissionError, ProcessLookupError, OSError):
+        return None
+    try:
+        _prefix, suffix = stat_text.rsplit(") ", 1)
+        parts = suffix.split()
+        return int(parts[1]), int(parts[19])
+    except (ValueError, IndexError):
+        return None
+
+
+def process_start_ticks(pid: Optional[int]) -> Optional[int]:
+    if not pid:
+        return None
+    identity = read_proc_identity(pid)
+    if identity is None:
+        return None
+    return identity[1]
 
 
 def setup_file_logging(log_file: Path) -> None:
     ensure_dir(log_file.parent)
-    handlers: list[logging.Handler] = [logging.FileHandler(log_file, encoding="utf-8")]
+    file_handler = logging.FileHandler(log_file, encoding="utf-8")
+    try:
+        os.chmod(log_file, PRIVATE_FILE_MODE)
+    except OSError:
+        pass
+    handlers: list[logging.Handler] = [file_handler]
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(message)s",
@@ -47,8 +127,7 @@ def setup_file_logging(log_file: Path) -> None:
 
 
 def write_json(path: Path, payload: dict[str, Any]) -> None:
-    ensure_dir(path.parent)
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    write_text_atomic(path, json.dumps(payload, ensure_ascii=False, indent=2))
 
 
 @dataclass
@@ -60,7 +139,11 @@ class SessionRecord:
     cwd: str
     argv: list[str]
     child_pid: Optional[int] = None
+    child_start_ticks: Optional[int] = None
     supervisor_pid: int = field(default_factory=os.getpid)
+    supervisor_start_ticks: Optional[int] = field(
+        default_factory=lambda: process_start_ticks(os.getpid())
+    )
     state: str = "starting"
     blocked: bool = False
     baseline_ip: Optional[str] = None
@@ -126,15 +209,15 @@ def iter_sessions(config: NetpotatoConfig) -> list[Path]:
     return sorted([path for path in root.iterdir() if path.is_dir()], reverse=True)
 
 
-def is_pid_running(pid: Optional[int]) -> bool:
+def is_pid_running(pid: Optional[int], expected_start_ticks: Optional[int] = None) -> bool:
     if not pid:
         return False
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
+    identity = read_proc_identity(pid)
+    if identity is None:
         return False
-    except PermissionError:
-        return True
+    _ppid, start_ticks = identity
+    if expected_start_ticks is not None and start_ticks != expected_start_ticks:
+        return False
     return True
 
 
@@ -143,16 +226,10 @@ def read_proc_ppids() -> dict[int, int]:
     for entry in Path("/proc").iterdir():
         if not entry.name.isdigit():
             continue
-        try:
-            stat_text = (entry / "stat").read_text(encoding="utf-8")
-        except (FileNotFoundError, PermissionError, ProcessLookupError):
+        identity = read_proc_identity(int(entry.name))
+        if identity is None:
             continue
-        try:
-            _prefix, suffix = stat_text.rsplit(") ", 1)
-            parts = suffix.split()
-            ppid = int(parts[1])
-        except (ValueError, IndexError):
-            continue
+        ppid, _start_ticks = identity
         mapping[int(entry.name)] = ppid
     return mapping
 
@@ -253,6 +330,14 @@ def emit_notification(
     logging.warning("%s\n%s", title, message)
     if not notify_command:
         return
+    try:
+        argv = shlex.split(notify_command)
+    except ValueError as exc:
+        logging.error("Failed to parse notify command: %s", exc)
+        return
+    if not argv:
+        logging.error("Failed to execute notify command: command is empty.")
+        return
 
     payload = json.dumps(
         {
@@ -278,8 +363,7 @@ def emit_notification(
     )
     try:
         completed = subprocess.run(
-            notify_command,
-            shell=True,
+            argv,
             env=env,
             capture_output=True,
             text=True,
@@ -352,6 +436,9 @@ def evaluate_snapshot(
     classification = "healthy"
     quality_reason = snapshot_quality_reason(snapshot, config)
     has_poor_ip_quality = config.ip_quality_enabled and quality_reason is not None
+    quality_check_missing = bool(
+        config.ip_quality_enabled and observed_baseline and snapshot.ip_quality is None
+    )
     if has_ip_change:
         reasons.append(f"observed public IP {observed_baseline} differs from baseline {baseline_ip}")
         classification = "unsafe"
@@ -360,6 +447,13 @@ def evaluate_snapshot(
         reasons.append(quality_reason)
         classification = "unsafe"
         should_block = should_block or config.on_ip_quality == "block"
+    elif quality_check_missing:
+        classification = "inconclusive"
+        reasons.append(
+            "IP quality check did not return a usable result"
+            if not snapshot.ip_quality_error
+            else f"IP quality check failed ({snapshot.ip_quality_error})"
+        )
     elif has_ip_mismatch:
         classification = "inconclusive"
     elif observed_baseline is None and (config.check_ip_change or config.ip_quality_enabled):
@@ -405,6 +499,7 @@ def preflight_launch(command: list[str], session: SessionRecord) -> subprocess.P
         start_new_session=True,
     )
     session.child_pid = process.pid
+    session.child_start_ticks = process_start_ticks(process.pid)
     return process
 
 
@@ -958,7 +1053,10 @@ def print_status(config: NetpotatoConfig, limit: int) -> int:
     ) -> dict[str, Any]:
         if payload.get("ended_at") is not None:
             return payload
-        if is_pid_running(payload.get("supervisor_pid")):
+        if is_pid_running(
+            payload.get("supervisor_pid"),
+            payload.get("supervisor_start_ticks"),
+        ):
             return payload
 
         payload["ended_at"] = now_iso()
@@ -982,8 +1080,11 @@ def print_status(config: NetpotatoConfig, limit: int) -> int:
         payload = reconcile_stale_session(session_file, payload)
         active = (
             payload.get("ended_at") is None
-            and is_pid_running(payload.get("child_pid"))
-            and is_pid_running(payload.get("supervisor_pid"))
+            and is_pid_running(payload.get("child_pid"), payload.get("child_start_ticks"))
+            and is_pid_running(
+                payload.get("supervisor_pid"),
+                payload.get("supervisor_start_ticks"),
+            )
         )
         if active:
             active_count += 1
