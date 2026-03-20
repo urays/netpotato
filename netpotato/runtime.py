@@ -20,7 +20,7 @@ from .config import NetpotatoConfig, resolve_command
 from .probes import (
     Snapshot,
     fetch_snapshot,
-    snapshot_baseline_ip,
+    snapshot_consensus_ip,
     snapshot_diagnostics,
     snapshot_quality_reason,
     snapshot_summary,
@@ -108,6 +108,11 @@ class Evaluation:
 
 class StartupGuardError(RuntimeError):
     """Raised when startup checks determine the app should not launch."""
+
+
+def use_direct_ip_probe(config: NetpotatoConfig) -> bool:
+    # The IP-change-only path can avoid the heavier multi-vantage HTML probe flow.
+    return config.check_ip_change and not config.check_ip_mismatch and not config.ip_quality_enabled
 
 
 def session_root(config: NetpotatoConfig) -> Path:
@@ -326,21 +331,27 @@ def evaluate_snapshot(
     should_block = False
     diagnostics = snapshot_diagnostics(snapshot)
     remote_missing = any(not value for value in (snapshot.domestic, snapshot.foreign, snapshot.google))
-    has_ip_mismatch = remote_missing or snapshot.is_remote_mismatch()
+    remote_mismatch = snapshot.is_remote_mismatch()
+    has_ip_mismatch = config.check_ip_mismatch and (remote_missing or remote_mismatch)
 
-    if remote_missing:
+    if config.check_ip_mismatch and remote_missing:
         reason = "probe results did not include all required IPs"
         if diagnostics:
             reason = f"{reason} ({'; '.join(diagnostics)})"
         reasons.append(reason)
-    if snapshot.is_remote_mismatch():
+    if config.check_ip_mismatch and remote_mismatch:
         reasons.append("probe results were inconsistent across vantage points")
 
-    observed_baseline = snapshot_baseline_ip(snapshot)
-    has_ip_change = bool(baseline_ip and observed_baseline and observed_baseline != baseline_ip)
+    observed_baseline = snapshot_consensus_ip(
+        snapshot,
+        allow_partial=not config.check_ip_mismatch,
+    )
+    has_ip_change = bool(
+        config.check_ip_change and baseline_ip and observed_baseline and observed_baseline != baseline_ip
+    )
     classification = "healthy"
     quality_reason = snapshot_quality_reason(snapshot, config)
-    has_poor_ip_quality = quality_reason is not None
+    has_poor_ip_quality = config.ip_quality_enabled and quality_reason is not None
     if has_ip_change:
         reasons.append(f"observed public IP {observed_baseline} differs from baseline {baseline_ip}")
         classification = "unsafe"
@@ -351,7 +362,7 @@ def evaluate_snapshot(
         should_block = should_block or config.on_ip_quality == "block"
     elif has_ip_mismatch:
         classification = "inconclusive"
-    elif observed_baseline is None:
+    elif observed_baseline is None and (config.check_ip_change or config.ip_quality_enabled):
         classification = "inconclusive"
         reasons.append("probe results could not establish a stable public IP")
 
@@ -404,19 +415,28 @@ def run_preflight_checks(
     session_file: Path,
 ) -> None:
     required_samples = config.preflight_good_samples
+    ready_to_launch = False
+    wait_title = (
+        f"{app_name} waiting for stable baseline"
+        if config.check_ip_change
+        else f"{app_name} waiting for healthy checks"
+    )
+    wait_prefix = "Reasons"
     state.record.state = "preflight"
     state.record.blocked = False
     state.record.block_reason = None
     update_session_record(session_file, state.record, None, None)
     logging.info("Starting preflight checks for %s", app_name)
 
-    while state.baseline_ip is None:
+    while not ready_to_launch:
         state.record.last_event = "preflight"
         try:
             snapshot = fetch_snapshot(
                 config.probe_url,
                 config.timeout_sec,
                 quality_enabled=config.ip_quality_enabled,
+                quality_ip_allow_partial=not config.check_ip_mismatch,
+                prefer_direct_ip=use_direct_ip_probe(config),
             )
             evaluation = evaluate_snapshot(snapshot, None, config)
             state.last_error = None
@@ -446,7 +466,8 @@ def run_preflight_checks(
                 )
                 raise StartupGuardError(message)
 
-            if (evaluation.healthy_sample or quality_is_notify_only) and evaluation.observed_baseline:
+            sample_ready = evaluation.healthy_sample or quality_is_notify_only
+            if sample_ready and (not config.check_ip_change or evaluation.observed_baseline):
                 state.bad_streak = 0
                 state.good_streak += 1
                 state.record.block_reason = None if evaluation.healthy_sample else "; ".join(evaluation.reasons) or None
@@ -459,19 +480,21 @@ def run_preflight_checks(
                         message="; ".join(evaluation.reasons),
                     )
                 if state.good_streak >= required_samples:
-                    state.baseline_ip = evaluation.observed_baseline
-                    state.record.baseline_ip = state.baseline_ip
                     state.record.state = "starting"
-                    notify_once(
-                        state,
-                        config.notify_command,
-                        event="baseline_created",
-                        title=f"{app_name} baseline established",
-                        message=(
-                            f"Baseline IP: {state.baseline_ip}\n\n"
-                            f"Snapshot: {snapshot_summary(snapshot)}"
-                        ),
-                    )
+                    ready_to_launch = True
+                    if config.check_ip_change:
+                        state.baseline_ip = evaluation.observed_baseline
+                        state.record.baseline_ip = state.baseline_ip
+                        notify_once(
+                            state,
+                            config.notify_command,
+                            event="baseline_created",
+                            title=f"{app_name} baseline established",
+                            message=(
+                                f"Baseline IP: {state.baseline_ip}\n\n"
+                                f"Snapshot: {snapshot_summary(snapshot)}"
+                            ),
+                        )
             else:
                 state.good_streak = 0
                 state.record.state = "preflight"
@@ -481,8 +504,8 @@ def run_preflight_checks(
                         state,
                         config.notify_command,
                         event="preflight_wait",
-                        title=f"{app_name} waiting for stable baseline",
-                        message=f"Reasons: {'; '.join(evaluation.reasons)}",
+                        title=wait_title,
+                        message=f"{wait_prefix}: {'; '.join(evaluation.reasons)}",
                     )
 
             update_session_record(session_file, state.record, snapshot, None)
@@ -514,7 +537,7 @@ def run_preflight_checks(
             update_session_record(session_file, state.record, None, error_message)
             logging.exception("Preflight probe failed: %s", error_message)
 
-        if state.baseline_ip is not None:
+        if ready_to_launch:
             break
         time.sleep(config.interval_sec)
 
@@ -533,6 +556,14 @@ def run_monitor_loop(
         if process.poll() is not None:
             stop_event.set()
             break
+        if first_check and not config.startup_fail_closed:
+            # App mode launches immediately, so delay the first network probe to avoid
+            # short-lived commands paying the cost of a monitor request on exit.
+            if stop_event.wait(timeout=config.interval_sec):
+                break
+            if process.poll() is not None:
+                stop_event.set()
+                break
         state.record.last_event = "startup" if first_check else "interval"
         first_check = False
 
@@ -541,6 +572,8 @@ def run_monitor_loop(
                 config.probe_url,
                 config.timeout_sec,
                 quality_enabled=config.ip_quality_enabled,
+                quality_ip_allow_partial=not config.check_ip_mismatch,
+                prefer_direct_ip=use_direct_ip_probe(config),
             )
             evaluation = evaluate_snapshot(snapshot, state.baseline_ip, config)
             state.last_error = None
@@ -575,7 +608,7 @@ def run_monitor_loop(
                 state.bad_streak = 0
                 state.good_streak += 1
                 state.inconclusive_streak = 0
-                if state.baseline_ip is None and evaluation.observed_baseline:
+                if config.check_ip_change and state.baseline_ip is None and evaluation.observed_baseline:
                     if state.good_streak >= config.preflight_good_samples:
                         state.baseline_ip = evaluation.observed_baseline
                         state.record.baseline_ip = state.baseline_ip
@@ -589,26 +622,31 @@ def run_monitor_loop(
                                 f"Snapshot: {snapshot_summary(snapshot)}"
                             ),
                         )
-                if state.blocked and state.baseline_ip is not None and state.good_streak >= config.recover_good_samples:
+                recovery_ready = not config.check_ip_change or state.baseline_ip is not None
+                if state.blocked and recovery_ready and state.good_streak >= config.recover_good_samples:
                     controller.unblock()
                     state.blocked = False
                     state.record.blocked = False
                     state.record.state = "healthy"
                     state.record.block_reason = None
+                    recovery_message = (
+                        f"Baseline IP restored: {state.baseline_ip}\n\nSnapshot: {snapshot_summary(snapshot)}"
+                        if state.baseline_ip is not None
+                        else f"Selected checks are healthy again.\n\nSnapshot: {snapshot_summary(snapshot)}"
+                    )
                     notify_once(
                         state,
                         config.notify_command,
                         event="recovered",
                         title=f"{app_name} recovered",
-                        message=(
-                            f"Baseline IP restored: {state.baseline_ip}\n\n"
-                            f"Snapshot: {snapshot_summary(snapshot)}"
-                        ),
+                        message=recovery_message,
                     )
                 elif state.blocked:
                     state.record.state = "recovering"
                     state.record.block_reason = None
-                elif not state.blocked and state.baseline_ip is not None:
+                elif not state.blocked and (
+                    state.baseline_ip is not None or not config.check_ip_change
+                ):
                     state.record.state = "healthy"
                     state.record.block_reason = None
                     state.last_transition = "steady:healthy"
@@ -829,6 +867,7 @@ def launch_command(config: NetpotatoConfig, command_argv: list[str]) -> int:
         session.baseline_ip = state.baseline_ip
         update_session_record(session_file, session, state.last_snapshot, state.last_error)
         logging.info("App exited with code %s", session.child_exit_code)
+        print("🥔: Bye!", flush=True)
 
     return session.child_exit_code if session.child_exit_code is not None else 1
 
@@ -845,8 +884,13 @@ def watch_test_status(config: NetpotatoConfig) -> int:
                     config.probe_url,
                     config.timeout_sec,
                     quality_enabled=config.ip_quality_enabled,
+                    quality_ip_allow_partial=not config.check_ip_mismatch,
+                    prefer_direct_ip=use_direct_ip_probe(config),
                 )
-                observed_ip = snapshot_baseline_ip(snapshot)
+                observed_ip = snapshot_consensus_ip(
+                    snapshot,
+                    allow_partial=not config.check_ip_mismatch,
+                )
                 evaluation = evaluate_snapshot(snapshot, baseline_ip, config)
                 diagnostics = list(evaluation.reasons)
                 action = "allow"
@@ -872,7 +916,7 @@ def watch_test_status(config: NetpotatoConfig) -> int:
                     bad_streak = 0
                     inconclusive_streak = 0
 
-                if baseline_ip is None and observed_ip and (
+                if config.check_ip_change and baseline_ip is None and observed_ip and (
                     evaluation.healthy_sample
                     or (evaluation.has_poor_ip_quality and config.on_ip_quality != "block")
                 ):

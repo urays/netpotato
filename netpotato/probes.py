@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime
 import html
@@ -16,6 +17,15 @@ from urllib.request import Request, urlopen
 
 DEFAULT_PROBE_URL = "https://ip111.cn/"
 DEFAULT_SCAMALYTICS_URL_TEMPLATE = "https://scamalytics.com/ip/{ip}"
+DIRECT_IP_CANDIDATE_URLS = (
+    "https://4.ipw.cn",
+    "https://myip.ipip.net",
+    "https://api64.ipify.org",
+    "https://icanhazip.com",
+    "https://ifconfig.me/ip",
+    "https://us.ip111.cn/ip.php",
+    "https://sspanel.net/ip.php",
+)
 
 SECTION_LABELS = {
     "domestic": "从国内测试",
@@ -89,16 +99,6 @@ class Snapshot:
 
     def available_remote_ips(self) -> list[str]:
         return [ip for ip in (self.domestic, self.foreign, self.google) if ip]
-
-    def missing_points(self) -> list[str]:
-        missing: list[str] = []
-        if not self.domestic:
-            missing.append("Domestic")
-        if not self.foreign:
-            missing.append("Overseas")
-        if not self.google:
-            missing.append("Google")
-        return missing
 
     def is_remote_mismatch(self) -> bool:
         return len(set(self.available_remote_ips())) > 1
@@ -388,6 +388,14 @@ def section_candidate_urls(section: str, iframe_sources: dict[str, str]) -> list
     return dedupe_strings(candidates)
 
 
+def candidate_referers(probe_url: str) -> list[str | None]:
+    return [*dedupe_strings([probe_url, DEFAULT_PROBE_URL]), None]
+
+
+def referer_label(referer: str | None) -> str:
+    return referer or "<no referer>"
+
+
 def fetch_section_ip(
     section: str,
     timeout: float,
@@ -399,14 +407,14 @@ def fetch_section_ip(
         return None, "", "no probe URL available"
 
     errors: list[str] = []
-    referers = dedupe_strings([probe_url, DEFAULT_PROBE_URL])
+    referers = candidate_referers(probe_url)
     for url in candidate_urls:
         for referer in referers:
             try:
                 ip = fetch_plain_ip(url, timeout, referer=referer)
                 return ip, url, None
             except Exception as exc:  # noqa: BLE001
-                errors.append(f"{url} via {referer}: {build_error_message(exc)}")
+                errors.append(f"{url} via {referer_label(referer)}: {build_error_message(exc)}")
 
     return None, candidate_urls[0], "; ".join(errors)
 
@@ -417,8 +425,70 @@ def fetch_scamalytics_quality(ip: str, timeout: float) -> IPQuality:
     return parse_scamalytics_quality(body, ip, source_url)
 
 
-def fetch_snapshot(probe_url: str, timeout: float, *, quality_enabled: bool = True) -> Snapshot:
-    body = fetch_url_text(probe_url, timeout)
+def direct_ip_candidate_urls(probe_url: str) -> list[str]:
+    preferred_url = probe_url if probe_url and probe_url != DEFAULT_PROBE_URL else ""
+    return dedupe_strings([preferred_url, *DIRECT_IP_CANDIDATE_URLS])
+
+
+def fetch_direct_ip_snapshot(probe_url: str, timeout: float) -> Snapshot:
+    candidate_urls = direct_ip_candidate_urls(probe_url)
+    if not candidate_urls:
+        raise RuntimeError("Direct IP probe failed: no direct IP URL available.")
+
+    errors: list[str] = []
+    referers = candidate_referers(probe_url)
+    for url in candidate_urls:
+        for referer in referers:
+            try:
+                ip = fetch_plain_ip(url, timeout, referer=referer)
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"{url} via {referer_label(referer)}: {build_error_message(exc)}")
+                continue
+
+            snapshot = Snapshot(
+                domestic=ip,
+                foreign=None,
+                google=None,
+                fetched_at=now_iso(),
+                source_url=url,
+            )
+            assign_section_result(snapshot, "domestic", ip, source=url)
+            return snapshot
+
+    raise RuntimeError(f"Direct IP probe failed: {'; '.join(errors)}")
+
+
+def fetch_snapshot(
+    probe_url: str,
+    timeout: float,
+    *,
+    quality_enabled: bool = True,
+    quality_ip_allow_partial: bool = False,
+    prefer_direct_ip: bool = False,
+) -> Snapshot:
+    direct_error: str | None = None
+    if prefer_direct_ip:
+        # Pure IP-change mode tries direct public-IP probes first, then falls back to the HTML page if needed.
+        try:
+            snapshot = fetch_direct_ip_snapshot(probe_url, timeout)
+        except Exception as exc:  # noqa: BLE001
+            direct_error = str(exc)
+        else:
+            stable_ip = snapshot.domestic
+            if quality_enabled and stable_ip:
+                try:
+                    snapshot.ip_quality = fetch_scamalytics_quality(stable_ip, timeout)
+                except Exception as exc:  # noqa: BLE001
+                    snapshot.ip_quality_error = build_error_message(exc)
+            return snapshot
+
+    try:
+        body = fetch_url_text(probe_url, timeout)
+    except Exception as exc:  # noqa: BLE001
+        if direct_error is not None:
+            error_message = build_error_message(exc)
+            raise RuntimeError(f"{direct_error}; HTML probe fallback failed: {error_message}") from exc
+        raise
     snapshot = parse_snapshot(body, probe_url)
     iframe_sources = discover_iframe_sources(body, probe_url)
 
@@ -431,7 +501,7 @@ def fetch_snapshot(probe_url: str, timeout: float, *, quality_enabled: bool = Tr
         ip, source, error = fetch_section_ip(section, timeout, probe_url, iframe_sources)
         assign_section_result(snapshot, section, ip, source=source, error=error)
 
-    stable_ip = snapshot_baseline_ip(snapshot)
+    stable_ip = snapshot_consensus_ip(snapshot, allow_partial=quality_ip_allow_partial)
     if quality_enabled and stable_ip:
         try:
             snapshot.ip_quality = fetch_scamalytics_quality(stable_ip, timeout)
@@ -524,11 +594,21 @@ def snapshot_quality_reason(snapshot: Snapshot, config: object) -> Optional[str]
     return "; ".join(reasons)
 
 
-def snapshot_baseline_ip(snapshot: Snapshot) -> Optional[str]:
+def snapshot_consensus_ip(snapshot: Snapshot, *, allow_partial: bool = False) -> Optional[str]:
     values = [snapshot.domestic, snapshot.foreign, snapshot.google]
-    if any(not value for value in values):
+    available = [value for value in values if value]
+    if not available:
         return None
-    unique = {value for value in values if value}
-    if len(unique) != 1:
-        return None
-    return next(iter(unique))
+    if not allow_partial:
+        if len(available) != len(values):
+            return None
+        unique = {value for value in available}
+        if len(unique) != 1:
+            return None
+        return next(iter(unique))
+
+    counts = Counter(available)
+    candidate, occurrences = counts.most_common(1)[0]
+    if occurrences > len(available) / 2:
+        return candidate
+    return None

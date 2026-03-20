@@ -31,6 +31,8 @@ class NetpotatoConfig:
     recover_good_samples: int = 2
     backend: str = "freeze"
     startup_fail_closed: bool = True
+    check_ip_change: bool = True
+    check_ip_mismatch: bool = True
     ip_quality_enabled: bool = True
     ip_quality_max_score: int = 70
     ip_quality_block_proxy: bool = True
@@ -38,7 +40,6 @@ class NetpotatoConfig:
     on_ip_mismatch: str = "notify"
     on_ip_quality: str = "block"
     on_probe_failure: str = "notify"
-    recovery_policy: str = "must_match_original_baseline"
     block_descendants: bool = True
     state_dir: Path = field(default_factory=default_state_dir)
 

@@ -2,18 +2,21 @@
 
 > Explicit IP guard for network-sensitive CLI commands.
 
-NetPotato wraps a command-line process, keeps checking the machine's public IP, and pauses the protected app if the observed IP becomes unsafe. By default it waits for a stable baseline IP before launching the protected app, checks the candidate IP against Scamalytics, and refuses to start if that IP looks risky.
+NetPotato wraps a command-line process, keeps checking the machine's public IP, and pauses the protected app if the selected checks say the current IP state is unsafe.
 
-NetPotato itself has two built-in commands: `test` and `status`. Any other invocation is treated as the target app to guard.
+If you do not pass an app command, NetPotato runs the selected checks in live test mode. If you do pass an app command, NetPotato protects that app with the selected checks.
+If you pass an app command without any `--check` option, NetPotato defaults to `--check="change"`.
 
 ## What It Does
 
 - Runs any CLI command under supervision.
-- Establishes a baseline public IP from stable probe results before launch by default.
-- Checks the startup IP quality with Scamalytics and blocks launch when the fraud score or proxy signals look risky.
-- Checks three probe views: `domestic`, `overseas`, and `google`.
+- Supports three selectable checks: `ip change`, `ip mismatch`, and `ip quality`.
+- Defaults to `ip change` only when you protect an app without an explicit `--check` value.
+- In CLI app mode, launches the app immediately and establishes a baseline afterward when `ip change` protection is active.
+- Uses Scamalytics only when `quality` is included in `--check`.
+- Uses the multi-vantage `domestic` / `overseas` / `google` probe flow when mismatch validation is needed.
 - Treats inconclusive probe results as `degraded` by default instead of freezing immediately.
-- Pauses the app if the observed IP drifts away from the session baseline or the IP quality is unsafe.
+- Pauses the app when an enabled check reports an unsafe state.
 - Resumes the app automatically when the original baseline is restored.
 - Records session state, logs, and IP incident counters on disk.
 
@@ -54,41 +57,61 @@ python -m pip install .
 
 ## Quick Start
 
-Run a protected app:
+Show help:
 
 ```bash
-netpotato python3 my_script.py
-netpotato app_name
-netpotato --startup-fail-open app_name
+netpotato
+```
+
+Show recent session status:
+
+```bash
+netpotato --status
+```
+
+Run live checks without launching an app:
+
+```bash
+netpotato --check="change"
+netpotato --check="mismatch"
+netpotato --check="quality"
+netpotato --check="change,mismatch"
+```
+
+Protect an app:
+
+```bash
+netpotato claude
+# equivalent to: netpotato --check="change" claude
+netpotato --check="change" claude
+netpotato --check="change,mismatch" codex --version
 ```
 
 If the protected app exits, `netpotato` exits too.
+When the protected app exits normally, NetPotato prints `netpotato: Bye!`.
 
-Useful guard options:
-
-```bash
-netpotato --interval 2 --timeout 3 codex
-netpotato --preflight-good-samples 3 --recover-good-samples 3 codex
-netpotato --on-ip-mismatch block --inconclusive-samples-to-block 5 codex
-netpotato --state-dir /tmp/netpotato-state codex
-```
-
-## Built-in Commands
-
-Watch the live probe state without launching an app:
+Supported options:
 
 ```bash
-netpotato test
+--status
+--check="change"
+--check="change,mismatch"
+--check="change,mismatch,quality"
 ```
 
-Show recent sessions:
+`--check` switches NetPotato into opt-in mode for checks. For example,
+`--check="change"` only monitors whether the session IP stays fixed, while
+`--check="change,quality"` enables fixed-IP drift and Scamalytics
+quality checks.
 
-```bash
-netpotato status
-netpotato status --limit 50
-```
+When app mode runs without an explicit `--check` value, NetPotato behaves as if
+`--check="change"` had been selected.
 
-`status` includes the current session state, whether the app is blocked, the
+When only `--check="change"` is enabled, NetPotato tries direct plain-text IP
+probe endpoints first and falls back to the HTML probe page if those endpoints
+reject the request.
+
+`--status` includes the current session state, whether the app is blocked, the
 child PID, the session start time, and three persisted counters:
 
 - `ip_mismatch_count`: how many times the probe results became inconsistent or incomplete.
@@ -97,17 +120,15 @@ child PID, the session start time, and three persisted counters:
 
 ## How It Works
 
-1. NetPotato creates a guarded session and starts collecting probe data.
-2. By default, it waits for enough healthy probe samples to establish a session baseline.
-3. It looks up that candidate IP on Scamalytics and blocks startup immediately if the IP quality is risky.
-4. It launches the target command in a new process session after the baseline is ready.
-5. It repeatedly fetches public IP probe data while the app is running.
-6. If the probe results become inconclusive, NetPotato moves the session to `degraded` by default instead of freezing immediately.
-7. If the current probe results confirm that the public IP changed, or if the observed IP quality is unsafe, NetPotato pauses the protected process tree.
-8. When the original baseline appears again for enough healthy checks, the app is resumed automatically.
+1. NetPotato creates a guarded session and starts collecting probe data for the enabled checks.
+2. In CLI app mode, it launches the target command immediately in a new process session.
+3. If `ip change` protection is active, it establishes a baseline IP after enough healthy samples.
+4. If `ip quality` protection is active, it checks the observed IP on Scamalytics during monitoring.
+5. It repeatedly fetches public-IP probe data while the app is running.
+6. If `ip mismatch` is active and the probe results become inconclusive, NetPotato moves the session to `degraded` by default instead of freezing immediately.
+7. If an enabled check confirms the current IP state is unsafe, NetPotato pauses the protected process tree.
+8. When the selected checks become healthy again for enough consecutive samples, the app is resumed automatically.
 9. When the target app exits, NetPotato finalizes the session record and exits.
-
-Use `--startup-fail-open` if you prefer the older behavior where the app starts immediately and the baseline is established after launch.
 
 ## State Files
 
