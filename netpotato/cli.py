@@ -18,7 +18,8 @@ EPILOG = """examples:
   netpotato --check="quality"
   netpotato --check="change,mismatch"
   netpotato claude
-    equivalent to: netpotato --check="change" claude
+    equivalent to: netpotato --check="change" --best-effort claude
+  netpotato --fail-closed claude
   netpotato --check="change" claude
   netpotato --check="change,mismatch" codex --version
 """
@@ -55,6 +56,17 @@ def build_parser() -> argparse.ArgumentParser:
             "Comma-separated checks to enable: change, mismatch, quality. "
             "Without an app, runs the selected checks in test mode."
         ),
+    )
+    launch_mode_group = parser.add_mutually_exclusive_group()
+    launch_mode_group.add_argument(
+        "--fail-closed",
+        action="store_true",
+        help="In app mode, wait for startup checks before launching the command.",
+    )
+    launch_mode_group.add_argument(
+        "--best-effort",
+        action="store_true",
+        help="In app mode, launch immediately and establish the baseline in the background (default).",
     )
     parser.add_argument(
         "command",
@@ -95,22 +107,26 @@ def config_from_selected_checks(selected_checks: list[str]) -> NetpotatoConfig:
     return replace(config, **updates)
 
 
-def app_config_from_selected_checks(selected_checks: list[str]) -> NetpotatoConfig:
-    # CLI app mode should launch immediately so short-lived commands do not stall in startup preflight.
+def app_config_from_selected_checks(
+    selected_checks: list[str],
+    *,
+    startup_fail_closed: bool,
+) -> NetpotatoConfig:
     return replace(
         config_from_selected_checks(selected_checks),
-        startup_fail_closed=False,
+        startup_fail_closed=startup_fail_closed,
     )
 
 
-def default_app_config() -> NetpotatoConfig:
-    # App mode defaults to the lightest guard and launches immediately unless the user opts into more checks.
+def default_app_config(*, startup_fail_closed: bool) -> NetpotatoConfig:
+    # App mode defaults to the lightest guard. Users can choose best-effort launch
+    # or fail-closed startup preflight explicitly.
     return replace(
         default_config(),
         check_ip_change=True,
         check_ip_mismatch=False,
         ip_quality_enabled=False,
-        startup_fail_closed=False,
+        startup_fail_closed=startup_fail_closed,
     )
 
 
@@ -148,8 +164,19 @@ def run_cli(argv: list[str] | None = None) -> int:
             return print_cli_error(parser, "--status cannot be combined with an app command.")
         return print_status(default_config(), limit=DEFAULT_STATUS_LIMIT)
 
+    if not command and (args.fail_closed or args.best_effort):
+        return print_cli_error(parser, "--fail-closed/--best-effort require an app command.")
+
     if command:
-        config = app_config_from_selected_checks(selected_checks) if selected_checks else default_app_config()
+        startup_fail_closed = args.fail_closed
+        config = (
+            app_config_from_selected_checks(
+                selected_checks,
+                startup_fail_closed=startup_fail_closed,
+            )
+            if selected_checks
+            else default_app_config(startup_fail_closed=startup_fail_closed)
+        )
         return launch_command(config, command)
 
     if selected_checks:

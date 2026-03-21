@@ -25,6 +25,7 @@ class NetpotatoConfig:
     timeout_sec: float = 10
     probe_url: str = DEFAULT_PROBE_URL
     notify_command: str | None = None
+    notify_timeout_sec: float = 5
     bad_samples_to_block: int = 1
     inconclusive_samples_to_block: int = 3
     preflight_good_samples: int = 2

@@ -31,6 +31,8 @@ from .probes import (
 
 PRIVATE_DIR_MODE = 0o700
 PRIVATE_FILE_MODE = 0o600
+EXIT_STARTUP_BLOCKED = 3
+EXIT_LAUNCH_ERROR = 4
 
 
 def now_iso() -> str:
@@ -198,6 +200,12 @@ def use_direct_ip_probe(config: NetpotatoConfig) -> bool:
     return config.check_ip_change and not config.check_ip_mismatch and not config.ip_quality_enabled
 
 
+def monitor_baseline_samples(config: NetpotatoConfig) -> int:
+    if config.startup_fail_closed:
+        return config.preflight_good_samples
+    return 1
+
+
 def session_root(config: NetpotatoConfig) -> Path:
     return config.state_dir / "sessions"
 
@@ -326,6 +334,7 @@ def emit_notification(
     title: str,
     message: str,
     session: SessionRecord,
+    timeout_sec: float = 5,
 ) -> None:
     logging.warning("%s\n%s", title, message)
     if not notify_command:
@@ -368,7 +377,11 @@ def emit_notification(
             capture_output=True,
             text=True,
             check=False,
+            timeout=timeout_sec,
         )
+    except subprocess.TimeoutExpired:
+        logging.error("Notify command timed out after %.1f seconds.", timeout_sec)
+        return
     except OSError as exc:
         logging.error("Failed to execute notify command: %s", exc)
         return
@@ -386,12 +399,20 @@ def notify_once(
     event: str,
     title: str,
     message: str,
+    timeout_sec: float = 5,
 ) -> None:
     key = f"{event}:{title}:{message}"
     if state.last_transition == key:
         return
     state.last_transition = key
-    emit_notification(notify_command, event, title, message, state.record)
+    emit_notification(
+        notify_command,
+        event,
+        title,
+        message,
+        state.record,
+        timeout_sec=timeout_sec,
+    )
 
 
 def update_session_record(
@@ -553,6 +574,7 @@ def run_preflight_checks(
                     event="startup_blocked",
                     title=f"{app_name} startup blocked by netpotato",
                     message=f"{message}\n\nSnapshot: {snapshot_summary(snapshot)}",
+                    timeout_sec=config.notify_timeout_sec,
                 )
                 print(
                     f"netpotato: blocked startup for {app_name}: {message}",
@@ -573,6 +595,7 @@ def run_preflight_checks(
                         event="ip_quality_warn",
                         title=f"{app_name} startup IP quality warning",
                         message="; ".join(evaluation.reasons),
+                        timeout_sec=config.notify_timeout_sec,
                     )
                 if state.good_streak >= required_samples:
                     state.record.state = "starting"
@@ -589,6 +612,7 @@ def run_preflight_checks(
                                 f"Baseline IP: {state.baseline_ip}\n\n"
                                 f"Snapshot: {snapshot_summary(snapshot)}"
                             ),
+                            timeout_sec=config.notify_timeout_sec,
                         )
             else:
                 state.good_streak = 0
@@ -601,6 +625,7 @@ def run_preflight_checks(
                         event="preflight_wait",
                         title=wait_title,
                         message=f"{wait_prefix}: {'; '.join(evaluation.reasons)}",
+                        timeout_sec=config.notify_timeout_sec,
                     )
 
             update_session_record(session_file, state.record, snapshot, None)
@@ -627,6 +652,7 @@ def run_preflight_checks(
                     event="probe_failure",
                     title=f"{app_name} preflight probe failed",
                     message=error_message,
+                    timeout_sec=config.notify_timeout_sec,
                 )
             state.last_error = error_message
             update_session_record(session_file, state.record, None, error_message)
@@ -651,14 +677,6 @@ def run_monitor_loop(
         if process.poll() is not None:
             stop_event.set()
             break
-        if first_check and not config.startup_fail_closed:
-            # App mode launches immediately, so delay the first network probe to avoid
-            # short-lived commands paying the cost of a monitor request on exit.
-            if stop_event.wait(timeout=config.interval_sec):
-                break
-            if process.poll() is not None:
-                stop_event.set()
-                break
         state.record.last_event = "startup" if first_check else "interval"
         first_check = False
 
@@ -692,6 +710,7 @@ def run_monitor_loop(
                         event="blocked",
                         title=f"{app_name} blocked by netpotato",
                         message=f"Reason: {block_reason}\n\nSnapshot: {snapshot_summary(snapshot)}",
+                        timeout_sec=config.notify_timeout_sec,
                     )
                 elif state.blocked:
                     state.record.state = "blocked"
@@ -704,7 +723,7 @@ def run_monitor_loop(
                 state.good_streak += 1
                 state.inconclusive_streak = 0
                 if config.check_ip_change and state.baseline_ip is None and evaluation.observed_baseline:
-                    if state.good_streak >= config.preflight_good_samples:
+                    if state.good_streak >= monitor_baseline_samples(config):
                         state.baseline_ip = evaluation.observed_baseline
                         state.record.baseline_ip = state.baseline_ip
                         notify_once(
@@ -716,6 +735,7 @@ def run_monitor_loop(
                                 f"Baseline IP: {state.baseline_ip}\n\n"
                                 f"Snapshot: {snapshot_summary(snapshot)}"
                             ),
+                            timeout_sec=config.notify_timeout_sec,
                         )
                 recovery_ready = not config.check_ip_change or state.baseline_ip is not None
                 if state.blocked and recovery_ready and state.good_streak >= config.recover_good_samples:
@@ -735,6 +755,7 @@ def run_monitor_loop(
                         event="recovered",
                         title=f"{app_name} recovered",
                         message=recovery_message,
+                        timeout_sec=config.notify_timeout_sec,
                     )
                 elif state.blocked:
                     state.record.state = "recovering"
@@ -768,6 +789,7 @@ def run_monitor_loop(
                                 event="blocked",
                                 title=f"{app_name} blocked by netpotato",
                                 message=f"Reason: {block_reason}\n\nSnapshot: {snapshot_summary(snapshot)}",
+                                timeout_sec=config.notify_timeout_sec,
                             )
                         else:
                             state.record.state = "blocked"
@@ -788,6 +810,7 @@ def run_monitor_loop(
                                     "The guard could not fully validate the current IP state.\n\n"
                                     f"Reasons: {'; '.join(evaluation.reasons)}"
                                 ),
+                                timeout_sec=config.notify_timeout_sec,
                             )
                 else:
                     state.inconclusive_streak = 0
@@ -806,6 +829,7 @@ def run_monitor_loop(
                                 f"Reasons: {'; '.join(evaluation.reasons)}\n\n"
                                 f"Snapshot: {snapshot_summary(snapshot)}"
                             ),
+                            timeout_sec=config.notify_timeout_sec,
                         )
 
             update_session_record(session_file, state.record, snapshot, None)
@@ -838,6 +862,7 @@ def run_monitor_loop(
                         event="blocked",
                         title=f"{app_name} blocked by netpotato",
                         message=f"Guard probe failure: {error_message}",
+                        timeout_sec=config.notify_timeout_sec,
                     )
             else:
                 state.bad_streak = 0
@@ -850,6 +875,7 @@ def run_monitor_loop(
                         event="probe_failure",
                         title=f"{app_name} probe failed",
                         message=error_message,
+                        timeout_sec=config.notify_timeout_sec,
                     )
             state.last_error = error_message
             update_session_record(session_file, state.record, None, error_message)
@@ -923,10 +949,26 @@ def launch_command(config: NetpotatoConfig, command_argv: list[str]) -> int:
         session.baseline_ip = state.baseline_ip
         session.ended_at = now_iso()
         update_session_record(session_file, session, state.last_snapshot, state.last_error)
-        return 3
+        return EXIT_STARTUP_BLOCKED
 
     logging.info("Launching command %s", command_argv)
-    process = preflight_launch(command_argv, session)
+    try:
+        process = preflight_launch(command_argv, session)
+    except (OSError, ValueError) as exc:
+        error_message = str(exc)
+        state.last_error = error_message
+        session.state = "error"
+        session.blocked = False
+        session.block_reason = error_message
+        session.ended_at = now_iso()
+        update_session_record(session_file, session, state.last_snapshot, error_message)
+        logging.error("Failed to launch command %s: %s", command_argv, error_message)
+        print(
+            f"netpotato: failed to launch {app_name}: {error_message}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return EXIT_LAUNCH_ERROR
     update_session_record(session_file, session, state.last_snapshot, state.last_error)
 
     controller = FreezeController(process.pid, config.block_descendants)
@@ -950,7 +992,9 @@ def launch_command(config: NetpotatoConfig, command_argv: list[str]) -> int:
                 continue
     finally:
         stop_event.set()
-        monitor_thread.join(timeout=2)
+        # The monitor thread is daemonized. Keep shutdown responsive instead of
+        # waiting for an in-flight probe to spend its full network timeout.
+        monitor_thread.join(timeout=0.2)
         if state.blocked:
             controller.unblock()
             state.blocked = False
@@ -1065,7 +1109,7 @@ def print_status(config: NetpotatoConfig, limit: int) -> int:
         try:
             write_json(session_file, payload)
         except OSError as exc:
-            logging.warning("Could not persist stale session %s: %s", session_file, exc)
+            logging.debug("Could not persist stale session %s: %s", session_file, exc)
         return payload
 
     active_count = 0

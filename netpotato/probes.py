@@ -41,6 +41,7 @@ KNOWN_SECTION_URLS = {
 RETRY_DELAYS_SEC = (0.25, 0.6)
 MAX_RESPONSE_BYTES = 1024 * 1024
 FETCHABLE_URL_SCHEMES = {"http", "https"}
+MIN_TIMEOUT_SLICE_SEC = 0.1
 
 IP_TOKEN_RE = re.compile(r"[0-9A-Fa-f:.%]+")
 HTML_TAG_RE = re.compile(r"(?s)<[^>]+>")
@@ -329,7 +330,36 @@ def decode_response_bytes(data: bytes, charset: str | None) -> str:
     return data.decode("utf-8", errors="ignore")
 
 
-def fetch_url_text(url: str, timeout: float, referer: str | None = None) -> str:
+def probe_deadline(timeout: float) -> float:
+    return time.monotonic() + max(timeout, MIN_TIMEOUT_SLICE_SEC)
+
+
+def remaining_timeout(timeout: float, deadline: float | None, context: str) -> float:
+    if deadline is None:
+        return timeout
+    remaining = deadline - time.monotonic()
+    if remaining < MIN_TIMEOUT_SLICE_SEC:
+        raise TimeoutError(f"Probe time budget exhausted before {context}.")
+    return min(timeout, remaining)
+
+
+def bounded_retry_sleep(delay: float, deadline: float | None) -> None:
+    if deadline is None:
+        time.sleep(delay)
+        return
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("Probe time budget exhausted during retry backoff.")
+    time.sleep(min(delay, remaining))
+
+
+def fetch_url_text(
+    url: str,
+    timeout: float,
+    referer: str | None = None,
+    *,
+    deadline: float | None = None,
+) -> str:
     if not is_fetchable_url(url):
         raise ValueError(f"Unsupported probe URL: {url!r}")
     headers = {
@@ -348,7 +378,8 @@ def fetch_url_text(url: str, timeout: float, referer: str | None = None) -> str:
     for attempt in range(len(RETRY_DELAYS_SEC) + 1):
         request = Request(url, headers=headers)
         try:
-            with urlopen(request, timeout=timeout) as response:
+            request_timeout = remaining_timeout(timeout, deadline, f"fetching {url}")
+            with urlopen(request, timeout=request_timeout) as response:
                 charset = response.headers.get_content_charset()
                 content_length_header = response.headers.get("Content-Length")
                 if content_length_header:
@@ -371,15 +402,21 @@ def fetch_url_text(url: str, timeout: float, referer: str | None = None) -> str:
             last_error = exc
             if attempt >= len(RETRY_DELAYS_SEC):
                 raise
-            time.sleep(RETRY_DELAYS_SEC[attempt])
+            bounded_retry_sleep(RETRY_DELAYS_SEC[attempt], deadline)
 
     if last_error is not None:
         raise last_error
     raise RuntimeError(f"Failed to fetch {url}")
 
 
-def fetch_plain_ip(url: str, timeout: float, referer: str | None = None) -> str:
-    body = fetch_url_text(url, timeout, referer=referer)
+def fetch_plain_ip(
+    url: str,
+    timeout: float,
+    referer: str | None = None,
+    *,
+    deadline: float | None = None,
+) -> str:
+    body = fetch_url_text(url, timeout, referer=referer, deadline=deadline)
     ip = extract_ip_from_line(body)
     if not ip:
         raise ValueError(f"Could not extract an IP address from the response returned by {url}.")
@@ -413,6 +450,8 @@ def fetch_section_ip(
     timeout: float,
     probe_url: str,
     iframe_sources: dict[str, str],
+    *,
+    deadline: float | None = None,
 ) -> tuple[Optional[str], str, Optional[str]]:
     candidate_urls = section_candidate_urls(section, iframe_sources)
     if not candidate_urls:
@@ -423,7 +462,7 @@ def fetch_section_ip(
     for url in candidate_urls:
         for referer in referers:
             try:
-                ip = fetch_plain_ip(url, timeout, referer=referer)
+                ip = fetch_plain_ip(url, timeout, referer=referer, deadline=deadline)
                 return ip, url, None
             except Exception as exc:  # noqa: BLE001
                 errors.append(f"{url} via {referer_label(referer)}: {build_error_message(exc)}")
@@ -431,9 +470,14 @@ def fetch_section_ip(
     return None, candidate_urls[0], "; ".join(errors)
 
 
-def fetch_scamalytics_quality(ip: str, timeout: float) -> IPQuality:
+def fetch_scamalytics_quality(ip: str, timeout: float, *, deadline: float | None = None) -> IPQuality:
     source_url = DEFAULT_SCAMALYTICS_URL_TEMPLATE.format(ip=ip)
-    body = fetch_url_text(source_url, timeout, referer="https://scamalytics.com/ip")
+    body = fetch_url_text(
+        source_url,
+        timeout,
+        referer="https://scamalytics.com/ip",
+        deadline=deadline,
+    )
     return parse_scamalytics_quality(body, ip, source_url)
 
 
@@ -449,6 +493,8 @@ def direct_ip_candidate_urls(probe_url: str) -> list[str]:
 def fetch_domestic_ip(
     probe_url: str,
     timeout: float,
+    *,
+    deadline: float | None = None,
 ) -> tuple[Optional[str], str, Optional[str]]:
     candidate_urls = direct_ip_candidate_urls(probe_url)
     if not candidate_urls:
@@ -459,7 +505,7 @@ def fetch_domestic_ip(
     for url in candidate_urls:
         for referer in referers:
             try:
-                ip = fetch_plain_ip(url, timeout, referer=referer)
+                ip = fetch_plain_ip(url, timeout, referer=referer, deadline=deadline)
                 return ip, url, None
             except Exception as exc:  # noqa: BLE001
                 errors.append(f"{url} via {referer_label(referer)}: {build_error_message(exc)}")
@@ -467,7 +513,12 @@ def fetch_domestic_ip(
     return None, candidate_urls[0], "; ".join(errors)
 
 
-def fetch_direct_ip_snapshot(probe_url: str, timeout: float) -> Snapshot:
+def fetch_direct_ip_snapshot(
+    probe_url: str,
+    timeout: float,
+    *,
+    deadline: float | None = None,
+) -> Snapshot:
     candidate_urls = direct_ip_candidate_urls(probe_url)
     if not candidate_urls:
         raise RuntimeError("Direct IP probe failed: no direct IP URL available.")
@@ -477,7 +528,7 @@ def fetch_direct_ip_snapshot(probe_url: str, timeout: float) -> Snapshot:
     for url in candidate_urls:
         for referer in referers:
             try:
-                ip = fetch_plain_ip(url, timeout, referer=referer)
+                ip = fetch_plain_ip(url, timeout, referer=referer, deadline=deadline)
             except Exception as exc:  # noqa: BLE001
                 errors.append(f"{url} via {referer_label(referer)}: {build_error_message(exc)}")
                 continue
@@ -503,24 +554,33 @@ def fetch_snapshot(
     quality_ip_allow_partial: bool = False,
     prefer_direct_ip: bool = False,
 ) -> Snapshot:
+    deadline = probe_deadline(timeout)
     direct_error: str | None = None
     if prefer_direct_ip:
         # Pure IP-change mode tries direct public-IP probes first, then falls back to the HTML page if needed.
         try:
-            snapshot = fetch_direct_ip_snapshot(probe_url, timeout)
+            snapshot = fetch_direct_ip_snapshot(
+                probe_url,
+                timeout,
+                deadline=deadline,
+            )
         except Exception as exc:  # noqa: BLE001
             direct_error = str(exc)
         else:
             stable_ip = snapshot.domestic
             if quality_enabled and stable_ip:
                 try:
-                    snapshot.ip_quality = fetch_scamalytics_quality(stable_ip, timeout)
+                    snapshot.ip_quality = fetch_scamalytics_quality(
+                        stable_ip,
+                        timeout,
+                        deadline=deadline,
+                    )
                 except Exception as exc:  # noqa: BLE001
                     snapshot.ip_quality_error = build_error_message(exc)
             return snapshot
 
     try:
-        body = fetch_url_text(probe_url, timeout)
+        body = fetch_url_text(probe_url, timeout, deadline=deadline)
     except Exception as exc:  # noqa: BLE001
         if direct_error is not None:
             error_message = build_error_message(exc)
@@ -530,7 +590,7 @@ def fetch_snapshot(
     iframe_sources = discover_iframe_sources(body, probe_url)
 
     if not snapshot.domestic:
-        ip, source, error = fetch_domestic_ip(probe_url, timeout)
+        ip, source, error = fetch_domestic_ip(probe_url, timeout, deadline=deadline)
         assign_section_result(snapshot, "domestic", ip, source=source, error=error)
     elif not snapshot.domestic_source:
         snapshot.domestic_source = probe_url
@@ -541,7 +601,14 @@ def fetch_snapshot(
     if missing_sections:
         with ThreadPoolExecutor(max_workers=len(missing_sections)) as executor:
             future_to_section = {
-                executor.submit(fetch_section_ip, section, timeout, probe_url, iframe_sources): section
+                executor.submit(
+                    fetch_section_ip,
+                    section,
+                    timeout,
+                    probe_url,
+                    iframe_sources,
+                    deadline=deadline,
+                ): section
                 for section in missing_sections
             }
             for future in as_completed(future_to_section):
@@ -552,7 +619,11 @@ def fetch_snapshot(
     stable_ip = snapshot_consensus_ip(snapshot, allow_partial=quality_ip_allow_partial)
     if quality_enabled and stable_ip:
         try:
-            snapshot.ip_quality = fetch_scamalytics_quality(stable_ip, timeout)
+            snapshot.ip_quality = fetch_scamalytics_quality(
+                stable_ip,
+                timeout,
+                deadline=deadline,
+            )
         except Exception as exc:  # noqa: BLE001
             snapshot.ip_quality_error = build_error_message(exc)
 

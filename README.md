@@ -37,7 +37,13 @@ netpotato my-command
 This is the same as:
 
 ```bash
-netpotato --check="change" my-command
+netpotato --check="change" --best-effort my-command
+```
+
+For strict startup protection:
+
+```bash
+netpotato --fail-closed my-command
 ```
 
 Common commands:
@@ -48,11 +54,19 @@ Common commands:
 | Show recent sessions | `netpotato --status` |
 | Watch the network only | `netpotato --check="change"` |
 | Watch with stricter checks | `netpotato --check="change,mismatch"` |
-| Protect a command | `netpotato my-command` |
-| Protect a command with stricter checks | `netpotato --check="change,mismatch" my-command` |
+| Protect a command in best-effort mode | `netpotato my-command` |
+| Protect a command with fail-closed startup checks | `netpotato --fail-closed my-command` |
+| Protect a command with stricter checks | `netpotato --fail-closed --check="change,mismatch" my-command` |
 
 > Full pause/resume protection is designed for Linux.
 > On other systems with Python and a terminal, `--check` mode may still work, but command protection is not the main target of the current release.
+
+## Protection Modes
+
+- `--best-effort`: launch the command immediately and establish the baseline in the background. This is the default in app mode.
+- `--fail-closed`: wait for startup probes before launching the command. Use this mode for short-lived or security-sensitive commands.
+
+If a command exits before the first probe finishes in `--best-effort` mode, NetPotato may not have enough time to establish a baseline. For strict enforcement, prefer `--fail-closed`.
 
 ## Checks
 
