@@ -26,11 +26,12 @@ class NetpotatoConfig:
     probe_url: str = DEFAULT_PROBE_URL
     notify_command: str | None = None
     notify_timeout_sec: float = 5
+    notify_queue_size: int = 32
     bad_samples_to_block: int = 1
     inconclusive_samples_to_block: int = 3
     preflight_good_samples: int = 2
     recover_good_samples: int = 2
-    backend: str = "freeze"
+    backend: str = "auto"
     startup_fail_closed: bool = True
     check_ip_change: bool = True
     check_ip_mismatch: bool = True

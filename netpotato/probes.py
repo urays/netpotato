@@ -9,6 +9,7 @@ from datetime import datetime
 import html
 import ipaddress
 import re
+from threading import Lock
 import time
 from typing import Optional
 from urllib.error import HTTPError, URLError
@@ -18,30 +19,29 @@ from urllib.request import Request, urlopen
 
 DEFAULT_PROBE_URL = "https://ip111.cn/"
 DEFAULT_SCAMALYTICS_URL_TEMPLATE = "https://scamalytics.com/ip/{ip}"
-DIRECT_IP_CANDIDATE_URLS = (
-    "https://4.ipw.cn",
-    "https://myip.ipip.net",
-    "https://api64.ipify.org",
-    "https://icanhazip.com",
-    "https://ifconfig.me/ip",
-    "https://us.ip111.cn/ip.php",
-    "https://sspanel.net/ip.php",
+DIRECT_IP_PROVIDER_ENDPOINTS = (
+    ("ipw-cn", "https://4.ipw.cn"),
+    ("ipip-net", "https://myip.ipip.net"),
+    ("ipify", "https://api64.ipify.org"),
+    ("icanhazip", "https://icanhazip.com"),
+    ("ifconfig-me", "https://ifconfig.me/ip"),
 )
+SECTION_DIRECT_PROVIDER_ENDPOINTS = {
+    "foreign": (("ip111-us", "https://us.ip111.cn/ip.php"),),
+    "google": (("sspanel-google", "https://sspanel.net/ip.php"),),
+}
 
 SECTION_LABELS = {
     "domestic": "从国内测试",
     "foreign": "从国外测试",
     "google": "从谷歌测试",
 }
-
-KNOWN_SECTION_URLS = {
-    "foreign": ("https://us.ip111.cn/ip.php",),
-    "google": ("https://sspanel.net/ip.php",),
-}
 RETRY_DELAYS_SEC = (0.25, 0.6)
 MAX_RESPONSE_BYTES = 1024 * 1024
 FETCHABLE_URL_SCHEMES = {"http", "https"}
 MIN_TIMEOUT_SLICE_SEC = 0.1
+PROVIDER_CIRCUIT_FAILURE_THRESHOLD = 2
+PROVIDER_CIRCUIT_RESET_SEC = 30.0
 
 IP_TOKEN_RE = re.compile(r"[0-9A-Fa-f:.%]+")
 HTML_TAG_RE = re.compile(r"(?s)<[^>]+>")
@@ -101,11 +101,36 @@ class Snapshot:
     ip_quality: Optional[IPQuality] = None
     ip_quality_error: Optional[str] = None
 
-    def available_remote_ips(self) -> list[str]:
-        return [ip for ip in (self.domestic, self.foreign, self.google) if ip]
+    def available_mismatch_ips(self) -> list[str]:
+        return [ip for ip in (self.foreign, self.google) if ip]
 
     def is_remote_mismatch(self) -> bool:
-        return len(set(self.available_remote_ips())) > 1
+        return len(set(self.available_mismatch_ips())) > 1
+
+
+@dataclass(frozen=True)
+class ProviderEndpoint:
+    url: str
+    referers: tuple[str | None, ...] = (None,)
+    include_probe_referers: bool = False
+
+
+@dataclass(frozen=True)
+class ProbeProvider:
+    name: str
+    endpoints: tuple[ProviderEndpoint, ...]
+    failure_threshold: int = PROVIDER_CIRCUIT_FAILURE_THRESHOLD
+    reset_sec: float = PROVIDER_CIRCUIT_RESET_SEC
+
+
+@dataclass
+class ProviderCircuitState:
+    failure_count: int = 0
+    opened_until: float = 0.0
+
+
+_PROVIDER_CIRCUITS: dict[str, ProviderCircuitState] = {}
+_PROVIDER_CIRCUITS_LOCK = Lock()
 
 
 def now_iso() -> str:
@@ -320,6 +345,50 @@ def dedupe_strings(values: list[str]) -> list[str]:
     return result
 
 
+def dedupe_referers(values: list[str | None]) -> list[str | None]:
+    result: list[str | None] = []
+    seen: set[str | None] = set()
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        result.append(value)
+    return result
+
+
+def reset_provider_circuits() -> None:
+    with _PROVIDER_CIRCUITS_LOCK:
+        _PROVIDER_CIRCUITS.clear()
+
+
+def provider_circuit_open(provider: ProbeProvider) -> bool:
+    with _PROVIDER_CIRCUITS_LOCK:
+        state = _PROVIDER_CIRCUITS.get(provider.name)
+        return bool(state and state.opened_until > time.monotonic())
+
+
+def mark_provider_success(provider: ProbeProvider) -> None:
+    with _PROVIDER_CIRCUITS_LOCK:
+        _PROVIDER_CIRCUITS.pop(provider.name, None)
+
+
+def mark_provider_failure(provider: ProbeProvider) -> None:
+    with _PROVIDER_CIRCUITS_LOCK:
+        state = _PROVIDER_CIRCUITS.setdefault(provider.name, ProviderCircuitState())
+        state.failure_count += 1
+        if state.failure_count >= provider.failure_threshold:
+            state.opened_until = time.monotonic() + provider.reset_sec
+
+
+def provider_skip_reason(provider: ProbeProvider) -> str:
+    with _PROVIDER_CIRCUITS_LOCK:
+        state = _PROVIDER_CIRCUITS.get(provider.name)
+        if state is None or state.opened_until <= time.monotonic():
+            return "available"
+        remaining = max(0.0, state.opened_until - time.monotonic())
+    return f"provider temporarily skipped by circuit breaker ({remaining:.1f}s remaining)"
+
+
 def decode_response_bytes(data: bytes, charset: str | None) -> str:
     encodings = dedupe_strings([charset or "", "utf-8", "gb18030", "latin-1"])
     for encoding in encodings:
@@ -423,15 +492,6 @@ def fetch_plain_ip(
     return ip
 
 
-def section_candidate_urls(section: str, iframe_sources: dict[str, str]) -> list[str]:
-    candidates: list[str] = []
-    iframe_url = iframe_sources.get(section)
-    if iframe_url:
-        candidates.append(iframe_url)
-    candidates.extend(KNOWN_SECTION_URLS.get(section, ()))
-    return [url for url in dedupe_strings(candidates) if is_fetchable_url(url)]
-
-
 def candidate_referers(probe_url: str) -> list[str | None]:
     valid_referers = [
         referer
@@ -445,72 +505,199 @@ def referer_label(referer: str | None) -> str:
     return referer or "<no referer>"
 
 
-def fetch_section_ip(
-    section: str,
-    timeout: float,
-    probe_url: str,
-    iframe_sources: dict[str, str],
-    *,
-    deadline: float | None = None,
-) -> tuple[Optional[str], str, Optional[str]]:
-    candidate_urls = section_candidate_urls(section, iframe_sources)
-    if not candidate_urls:
-        return None, "", "no probe URL available"
-
-    errors: list[str] = []
-    referers = candidate_referers(probe_url)
-    for url in candidate_urls:
-        for referer in referers:
-            try:
-                ip = fetch_plain_ip(url, timeout, referer=referer, deadline=deadline)
-                return ip, url, None
-            except Exception as exc:  # noqa: BLE001
-                errors.append(f"{url} via {referer_label(referer)}: {build_error_message(exc)}")
-
-    return None, candidate_urls[0], "; ".join(errors)
-
-
-def fetch_scamalytics_quality(ip: str, timeout: float, *, deadline: float | None = None) -> IPQuality:
-    source_url = DEFAULT_SCAMALYTICS_URL_TEMPLATE.format(ip=ip)
-    body = fetch_url_text(
-        source_url,
-        timeout,
-        referer="https://scamalytics.com/ip",
-        deadline=deadline,
+def domestic_direct_providers(probe_url: str) -> tuple[ProbeProvider, ...]:
+    providers: list[ProbeProvider] = []
+    if probe_url and probe_url != DEFAULT_PROBE_URL and is_fetchable_url(probe_url):
+        providers.append(
+            ProbeProvider(
+                name="custom-direct-probe",
+                endpoints=(ProviderEndpoint(probe_url, include_probe_referers=True),),
+            )
+        )
+    providers.extend(
+        ProbeProvider(name=name, endpoints=(ProviderEndpoint(url),))
+        for name, url in DIRECT_IP_PROVIDER_ENDPOINTS
     )
-    return parse_scamalytics_quality(body, ip, source_url)
+    return tuple(providers)
 
 
-def direct_ip_candidate_urls(probe_url: str) -> list[str]:
-    preferred_url = probe_url if probe_url and probe_url != DEFAULT_PROBE_URL else ""
-    return [
-        url
-        for url in dedupe_strings([preferred_url, *DIRECT_IP_CANDIDATE_URLS])
-        if is_fetchable_url(url)
-    ]
+def section_direct_providers(
+    section: str,
+    iframe_sources: dict[str, str],
+) -> tuple[ProbeProvider, ...]:
+    providers: list[ProbeProvider] = []
+    iframe_url = iframe_sources.get(section)
+    if iframe_url and is_fetchable_url(iframe_url):
+        providers.append(
+            ProbeProvider(
+                name=f"{section}-iframe",
+                endpoints=(ProviderEndpoint(iframe_url, include_probe_referers=True),),
+            )
+        )
+    providers.extend(
+        ProbeProvider(
+            name=name,
+            endpoints=(ProviderEndpoint(url, include_probe_referers=True),),
+        )
+        for name, url in SECTION_DIRECT_PROVIDER_ENDPOINTS.get(section, ())
+    )
+    return tuple(providers)
 
 
-def fetch_domestic_ip(
-    probe_url: str,
+def html_snapshot_providers(probe_url: str) -> tuple[ProbeProvider, ...]:
+    providers: list[ProbeProvider] = []
+    if is_fetchable_url(probe_url):
+        providers.append(
+            ProbeProvider(
+                name="custom-html-probe" if probe_url != DEFAULT_PROBE_URL else "ip111-html",
+                endpoints=(ProviderEndpoint(probe_url),),
+            )
+        )
+    if probe_url != DEFAULT_PROBE_URL:
+        providers.append(
+            ProbeProvider(
+                name="ip111-html",
+                endpoints=(ProviderEndpoint(DEFAULT_PROBE_URL),),
+            )
+        )
+    return tuple(providers)
+
+
+def quality_providers(ip: str) -> tuple[ProbeProvider, ...]:
+    return (
+        ProbeProvider(
+            name="scamalytics",
+            endpoints=(
+                ProviderEndpoint(
+                    DEFAULT_SCAMALYTICS_URL_TEMPLATE.format(ip=ip),
+                    referers=("https://scamalytics.com/ip",),
+                ),
+            ),
+        ),
+    )
+
+
+def provider_endpoint_referers(endpoint: ProviderEndpoint, probe_url: str) -> list[str | None]:
+    referers = list(endpoint.referers)
+    if endpoint.include_probe_referers:
+        referers = [*candidate_referers(probe_url), *referers]
+    return dedupe_referers(referers or [None])
+
+
+def fetch_plain_ip_from_providers(
+    providers: tuple[ProbeProvider, ...],
     timeout: float,
+    probe_url: str,
     *,
     deadline: float | None = None,
 ) -> tuple[Optional[str], str, Optional[str]]:
-    candidate_urls = direct_ip_candidate_urls(probe_url)
-    if not candidate_urls:
-        return None, "", "no probe URL available"
+    if not providers:
+        return None, "", "no provider available"
 
     errors: list[str] = []
-    referers = candidate_referers(probe_url)
-    for url in candidate_urls:
-        for referer in referers:
-            try:
-                ip = fetch_plain_ip(url, timeout, referer=referer, deadline=deadline)
-                return ip, url, None
-            except Exception as exc:  # noqa: BLE001
-                errors.append(f"{url} via {referer_label(referer)}: {build_error_message(exc)}")
+    first_source = providers[0].endpoints[0].url if providers[0].endpoints else ""
+    for provider in providers:
+        if provider_circuit_open(provider):
+            errors.append(f"{provider.name}: {provider_skip_reason(provider)}")
+            continue
 
-    return None, candidate_urls[0], "; ".join(errors)
+        provider_errors: list[str] = []
+        for endpoint in provider.endpoints:
+            first_source = first_source or endpoint.url
+            for referer in provider_endpoint_referers(endpoint, probe_url):
+                try:
+                    ip = fetch_plain_ip(endpoint.url, timeout, referer=referer, deadline=deadline)
+                except Exception as exc:  # noqa: BLE001
+                    provider_errors.append(
+                        f"{endpoint.url} via {referer_label(referer)}: {build_error_message(exc)}"
+                    )
+                    continue
+                mark_provider_success(provider)
+                return ip, endpoint.url, None
+
+        mark_provider_failure(provider)
+        errors.append(f"{provider.name}: {'; '.join(provider_errors)}")
+
+    return None, first_source, "; ".join(errors)
+
+
+def fetch_snapshot_from_html_providers(
+    providers: tuple[ProbeProvider, ...],
+    timeout: float,
+    probe_url: str,
+    *,
+    deadline: float | None = None,
+) -> tuple[Snapshot, dict[str, str]]:
+    if not providers:
+        raise RuntimeError("no HTML probe provider available")
+
+    errors: list[str] = []
+    for provider in providers:
+        if provider_circuit_open(provider):
+            errors.append(f"{provider.name}: {provider_skip_reason(provider)}")
+            continue
+
+        provider_errors: list[str] = []
+        for endpoint in provider.endpoints:
+            for referer in provider_endpoint_referers(endpoint, probe_url):
+                try:
+                    body = fetch_url_text(
+                        endpoint.url,
+                        timeout,
+                        referer=referer,
+                        deadline=deadline,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    provider_errors.append(
+                        f"{endpoint.url} via {referer_label(referer)}: {build_error_message(exc)}"
+                    )
+                    continue
+
+                mark_provider_success(provider)
+                return parse_snapshot(body, endpoint.url), discover_iframe_sources(body, endpoint.url)
+
+        mark_provider_failure(provider)
+        errors.append(f"{provider.name}: {'; '.join(provider_errors)}")
+
+    raise RuntimeError("; ".join(errors))
+
+
+def fetch_ip_quality(
+    ip: str,
+    timeout: float,
+    *,
+    deadline: float | None = None,
+) -> IPQuality:
+    providers = quality_providers(ip)
+    errors: list[str] = []
+    for provider in providers:
+        if provider_circuit_open(provider):
+            errors.append(f"{provider.name}: {provider_skip_reason(provider)}")
+            continue
+
+        provider_errors: list[str] = []
+        for endpoint in provider.endpoints:
+            for referer in provider_endpoint_referers(endpoint, DEFAULT_PROBE_URL):
+                try:
+                    body = fetch_url_text(
+                        endpoint.url,
+                        timeout,
+                        referer=referer,
+                        deadline=deadline,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    provider_errors.append(
+                        f"{endpoint.url} via {referer_label(referer)}: {build_error_message(exc)}"
+                    )
+                    continue
+
+                mark_provider_success(provider)
+                return parse_scamalytics_quality(body, ip, endpoint.url)
+
+        mark_provider_failure(provider)
+        errors.append(f"{provider.name}: {'; '.join(provider_errors)}")
+
+    raise RuntimeError("; ".join(errors))
 
 
 def fetch_direct_ip_snapshot(
@@ -519,31 +706,24 @@ def fetch_direct_ip_snapshot(
     *,
     deadline: float | None = None,
 ) -> Snapshot:
-    candidate_urls = direct_ip_candidate_urls(probe_url)
-    if not candidate_urls:
-        raise RuntimeError("Direct IP probe failed: no direct IP URL available.")
+    ip, source, error = fetch_plain_ip_from_providers(
+        domestic_direct_providers(probe_url),
+        timeout,
+        probe_url,
+        deadline=deadline,
+    )
+    if not ip:
+        raise RuntimeError(f"Direct IP probe failed: {error or 'no provider returned an IP'}")
 
-    errors: list[str] = []
-    referers = candidate_referers(probe_url)
-    for url in candidate_urls:
-        for referer in referers:
-            try:
-                ip = fetch_plain_ip(url, timeout, referer=referer, deadline=deadline)
-            except Exception as exc:  # noqa: BLE001
-                errors.append(f"{url} via {referer_label(referer)}: {build_error_message(exc)}")
-                continue
-
-            snapshot = Snapshot(
-                domestic=ip,
-                foreign=None,
-                google=None,
-                fetched_at=now_iso(),
-                source_url=url,
-            )
-            assign_section_result(snapshot, "domestic", ip, source=url)
-            return snapshot
-
-    raise RuntimeError(f"Direct IP probe failed: {'; '.join(errors)}")
+    snapshot = Snapshot(
+        domestic=ip,
+        foreign=None,
+        google=None,
+        fetched_at=now_iso(),
+        source_url=source,
+    )
+    assign_section_result(snapshot, "domestic", ip, source=source)
+    return snapshot
 
 
 def fetch_snapshot(
@@ -570,7 +750,7 @@ def fetch_snapshot(
             stable_ip = snapshot.domestic
             if quality_enabled and stable_ip:
                 try:
-                    snapshot.ip_quality = fetch_scamalytics_quality(
+                    snapshot.ip_quality = fetch_ip_quality(
                         stable_ip,
                         timeout,
                         deadline=deadline,
@@ -579,47 +759,92 @@ def fetch_snapshot(
                     snapshot.ip_quality_error = build_error_message(exc)
             return snapshot
 
-    try:
-        body = fetch_url_text(probe_url, timeout, deadline=deadline)
-    except Exception as exc:  # noqa: BLE001
-        if direct_error is not None:
-            error_message = build_error_message(exc)
-            raise RuntimeError(f"{direct_error}; HTML probe fallback failed: {error_message}") from exc
-        raise
-    snapshot = parse_snapshot(body, probe_url)
-    iframe_sources = discover_iframe_sources(body, probe_url)
+    snapshot = Snapshot(
+        domestic=None,
+        foreign=None,
+        google=None,
+        fetched_at=now_iso(),
+        source_url=probe_url,
+    )
 
-    if not snapshot.domestic:
-        ip, source, error = fetch_domestic_ip(probe_url, timeout, deadline=deadline)
-        assign_section_result(snapshot, "domestic", ip, source=source, error=error)
-    elif not snapshot.domestic_source:
-        snapshot.domestic_source = probe_url
+    domestic_ip, domestic_source, domestic_error = fetch_plain_ip_from_providers(
+        domestic_direct_providers(probe_url),
+        timeout,
+        probe_url,
+        deadline=deadline,
+    )
+    assign_section_result(snapshot, "domestic", domestic_ip, source=domestic_source, error=domestic_error)
 
-    missing_sections = [
-        section for section in ("foreign", "google") if not getattr(snapshot, section)
-    ]
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        future_to_section = {
+            executor.submit(
+                fetch_plain_ip_from_providers,
+                section_direct_providers(section, {}),
+                timeout,
+                probe_url,
+                deadline=deadline,
+            ): section
+            for section in ("foreign", "google")
+        }
+        for future in as_completed(future_to_section):
+            section = future_to_section[future]
+            ip, source, error = future.result()
+            assign_section_result(snapshot, section, ip, source=source, error=error)
+
+    missing_sections = [section for section in ("domestic", "foreign", "google") if not getattr(snapshot, section)]
     if missing_sections:
-        with ThreadPoolExecutor(max_workers=len(missing_sections)) as executor:
-            future_to_section = {
-                executor.submit(
-                    fetch_section_ip,
-                    section,
-                    timeout,
-                    probe_url,
-                    iframe_sources,
-                    deadline=deadline,
-                ): section
-                for section in missing_sections
-            }
-            for future in as_completed(future_to_section):
-                section = future_to_section[future]
-                ip, source, error = future.result()
-                assign_section_result(snapshot, section, ip, source=source, error=error)
+        try:
+            html_snapshot, iframe_sources = fetch_snapshot_from_html_providers(
+                html_snapshot_providers(probe_url),
+                timeout,
+                probe_url,
+                deadline=deadline,
+            )
+        except Exception as exc:  # noqa: BLE001
+            if direct_error is not None:
+                error_message = build_error_message(exc)
+                raise RuntimeError(f"{direct_error}; HTML probe fallback failed: {error_message}") from exc
+            html_error = build_error_message(exc)
+            for section in missing_sections:
+                existing_error = getattr(snapshot, _section_error_attr(section), None)
+                combined_error = (
+                    html_error
+                    if not existing_error
+                    else f"{existing_error}; html fallback: {html_error}"
+                )
+                setattr(snapshot, _section_error_attr(section), combined_error)
+        else:
+            if html_snapshot.source_url:
+                snapshot.source_url = html_snapshot.source_url
+            for section in missing_sections:
+                value = getattr(html_snapshot, section)
+                if value:
+                    assign_section_result(snapshot, section, value, source=html_snapshot.source_url)
+
+            iframe_missing_sections = [
+                section for section in ("foreign", "google") if not getattr(snapshot, section)
+            ]
+            if iframe_missing_sections:
+                with ThreadPoolExecutor(max_workers=len(iframe_missing_sections)) as executor:
+                    future_to_section = {
+                        executor.submit(
+                            fetch_plain_ip_from_providers,
+                            section_direct_providers(section, iframe_sources),
+                            timeout,
+                            probe_url,
+                            deadline=deadline,
+                        ): section
+                        for section in iframe_missing_sections
+                    }
+                    for future in as_completed(future_to_section):
+                        section = future_to_section[future]
+                        ip, source, error = future.result()
+                        assign_section_result(snapshot, section, ip, source=source, error=error)
 
     stable_ip = snapshot_consensus_ip(snapshot, allow_partial=quality_ip_allow_partial)
     if quality_enabled and stable_ip:
         try:
-            snapshot.ip_quality = fetch_scamalytics_quality(
+            snapshot.ip_quality = fetch_ip_quality(
                 stable_ip,
                 timeout,
                 deadline=deadline,
@@ -643,9 +868,13 @@ def snapshot_summary(snapshot: Snapshot) -> str:
     return summary
 
 
-def snapshot_diagnostics(snapshot: Snapshot) -> list[str]:
+def snapshot_diagnostics(
+    snapshot: Snapshot,
+    *,
+    sections: tuple[str, ...] = ("domestic", "foreign", "google"),
+) -> list[str]:
     diagnostics: list[str] = []
-    for section in ("domestic", "foreign", "google"):
+    for section in sections:
         value = getattr(snapshot, section)
         error = getattr(snapshot, _section_error_attr(section), None)
         source = getattr(snapshot, _section_source_attr(section), "")
@@ -714,20 +943,28 @@ def snapshot_quality_reason(snapshot: Snapshot, config: object) -> Optional[str]
 
 
 def snapshot_consensus_ip(snapshot: Snapshot, *, allow_partial: bool = False) -> Optional[str]:
+    if not allow_partial:
+        if not snapshot.foreign or not snapshot.google:
+            return None
+        if snapshot.foreign != snapshot.google:
+            return None
+        return snapshot.foreign
+
     values = [snapshot.domestic, snapshot.foreign, snapshot.google]
     available = [value for value in values if value]
     if not available:
         return None
-    if not allow_partial:
-        if len(available) != len(values):
-            return None
-        unique = {value for value in available}
-        if len(unique) != 1:
-            return None
-        return next(iter(unique))
 
     counts = Counter(available)
     candidate, occurrences = counts.most_common(1)[0]
     if occurrences > len(available) / 2:
         return candidate
+    return None
+
+
+def snapshot_change_ip(snapshot: Snapshot) -> Optional[str]:
+    if snapshot.domestic:
+        return snapshot.domestic
+    if snapshot.foreign and snapshot.google and snapshot.foreign == snapshot.google:
+        return snapshot.foreign
     return None

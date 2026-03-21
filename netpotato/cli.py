@@ -15,13 +15,14 @@ EPILOG = """examples:
   netpotato --status
   netpotato --check="change"
   netpotato --check="mismatch"
-  netpotato --check="quality"
   netpotato --check="change,mismatch"
   netpotato claude
-    equivalent to: netpotato --check="change" --best-effort claude
+    best-effort change monitoring, plus automatic IP quality gates
   netpotato --fail-closed claude
   netpotato --check="change" claude
   netpotato --check="change,mismatch" codex --version
+
+app mode runs an IP quality gate before launch and once for each newly observed IP.
 """
 
 DEFAULT_STATUS_LIMIT = 20
@@ -29,7 +30,6 @@ DEFAULT_STATUS_LIMIT = 20
 CHECK_SELECTOR_FIELDS = {
     "change": "check_ip_change",
     "mismatch": "check_ip_mismatch",
-    "quality": "ip_quality_enabled",
 }
 
 
@@ -37,7 +37,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="netpotato",
         description=(
-            "Run selected IP checks in test mode, or protect an app with those checks."
+            "Run selected runtime IP checks in test mode, or protect an app with "
+            "those checks plus a startup IP quality gate."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=EPILOG,
@@ -53,7 +54,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="LIST",
         help=(
-            "Comma-separated checks to enable: change, mismatch, quality. "
+            "Comma-separated runtime checks to enable: change, mismatch. "
             "Without an app, runs the selected checks in test mode."
         ),
     )
@@ -119,8 +120,8 @@ def app_config_from_selected_checks(
 
 
 def default_app_config(*, startup_fail_closed: bool) -> NetpotatoConfig:
-    # App mode defaults to the lightest guard. Users can choose best-effort launch
-    # or fail-closed startup preflight explicitly.
+    # App mode always runs a startup IP quality gate before launch. The default
+    # runtime guard is still the lightest change-only monitor.
     return replace(
         default_config(),
         check_ip_change=True,

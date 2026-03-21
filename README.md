@@ -34,11 +34,9 @@ Use the default protection:
 netpotato my-command
 ```
 
-This is the same as:
-
-```bash
-netpotato --check="change" --best-effort my-command
-```
+This always runs a startup IP quality gate first, then enables best-effort
+change monitoring. If the observed IP changes later, NetPotato runs one quality
+check for that new IP before allowing the command to recover.
 
 For strict startup protection:
 
@@ -60,6 +58,7 @@ Common commands:
 
 > Full pause/resume protection is designed for Linux.
 > On other systems with Python and a terminal, `--check` mode may still work, but command protection is not the main target of the current release.
+> On Linux, NetPotato prefers a cgroup freezer backend when the current cgroup is writable, and falls back to signal-based freezing otherwise.
 
 ## Protection Modes
 
@@ -68,11 +67,18 @@ Common commands:
 
 If a command exits before the first probe finishes in `--best-effort` mode, NetPotato may not have enough time to establish a baseline. For strict enforcement, prefer `--fail-closed`.
 
+## Startup Quality Gate
+
+- If the IP is rated as risky, NetPotato notifies and exits without starting the command.
+- At startup, before the protected command is launched.
+- Once for each newly observed IP while the command is running.
+- A blocked command only resumes after the current IP has passed that quality gate.
+- This gate is independent of `change` and `mismatch`.
+
 ## Checks
 
 - `change`: pause the command if your public IP changes
 - `mismatch`: warn when different probes do not agree on the current IP
-- `quality`: check whether the current IP looks risky
 
 ## Status Files
 
